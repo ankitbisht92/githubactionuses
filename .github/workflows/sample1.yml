@@ -3,8 +3,7 @@ name: Shell Command
 on:
   push:
   pull_request:
-    types: [closed,assigned,opened,repoened]
-
+    types: [closed,assigned,opened,reopened]
 jobs:
   run-shell-command:
     runs-on: ubuntu-latest
@@ -15,7 +14,7 @@ jobs:
             echo $GITHUB_REPOSITORY
             echo "Hello Mars"
             echo "Hello Jupiter"
-            echo "Hello New Jupiter"
+            echo "Hello Old Jupiter"
         - name: multiplescript
           run: |
            node -v
