@@ -11,7 +11,7 @@ jobs:
             echo "Hello World"
             echo $GITHUB_REPOSITORY
             echo "Hello Mars"
-            echo "Hello Jupiter"
+            echo "Hello Jupiter Updated"
         - name: multiplescript
           run: |
            node -v
