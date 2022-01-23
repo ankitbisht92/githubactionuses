@@ -1,6 +1,6 @@
 name: Shell Command
 
-on: [push]
+on: [push,pull_request]
 
 jobs:
   run-shell-command:
@@ -10,6 +10,7 @@ jobs:
           run: |
             echo "Hello World"
             echo $GITHUB_REPOSITORY
+            echo "Hello Mars"
         - name: multiplescript
           run: |
            node -v
