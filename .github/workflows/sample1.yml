@@ -9,7 +9,7 @@ jobs:
         - name: echo a string
           run: |
             echo "Hello World"
-            echo $OWNER_NAME
+            echo $GITHUB_REPOSITORY
         - name: multiplescript
           run: |
            node -v
