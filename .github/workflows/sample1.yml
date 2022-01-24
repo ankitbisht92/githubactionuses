@@ -3,7 +3,7 @@ name: Shell Command
 on:
   #schedule:
   # - cron: '0/10 * * * *'
-  push:
+  #push:
   pull_request:
    types: [closed,assigned,opened,reopened]
 env:
