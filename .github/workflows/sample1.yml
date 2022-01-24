@@ -16,7 +16,7 @@ jobs:
         - name: echo a string
           run: |
             echo "Hello World"
-            echo "The Job Description is ${JOB_VARIABLE}"
+            echo "The Job Description is '${JOB_VARIABLE}'"
             echo $GITHUB_REPOSITORY
             echo "Hello Mars"
             echo "Hello Jupiter"
