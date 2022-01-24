@@ -3,6 +3,7 @@ name: Shell Command
 on: [push]
 
 jobs:
+  #first Job
   run-shell-command:
     runs-on: ubuntu-latest
     steps:
@@ -14,6 +15,7 @@ jobs:
            npm -v
   
   run-windows-command:
+    #second Job
     runs-on: windows-latest
     needs: ["run-shell-command"]
     steps:
