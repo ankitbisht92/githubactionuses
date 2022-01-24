@@ -17,7 +17,7 @@ jobs:
           run: |
             echo "Hello World"
             echo "The Job Description is '${JOB_VARIABLE}'"
-            echo $GITHUB_REPOSITORY
+            echo "The Code Repository is '${GITHUB_REPOSITORY}'""
             echo "Hello Mars"
             echo "Hello Jupiter"
             echo "Hello Old Jupiter"
