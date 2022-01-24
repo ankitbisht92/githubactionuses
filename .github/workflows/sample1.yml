@@ -1,14 +1,23 @@
 name: Shell Command
 
-on: [push]
-
+on:
+  #schedule:
+  # - cron: '0/10 * * * *'
+  push:
+  pull_request:
+   types: [closed,assigned,opened,reopened]
 jobs:
   #first Job
   run-shell-command:
     runs-on: ubuntu-latest
     steps:
         - name: echo a string
-          run: echo "Hello World"
+          run: |
+            echo "Hello World"
+            echo $GITHUB_REPOSITORY
+            echo "Hello Mars"
+            echo "Hello Jupiter"
+            echo "Hello Old Jupiter"
         - name: multiplescript
           run: |
            node -v
