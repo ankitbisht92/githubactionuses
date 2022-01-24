@@ -10,10 +10,13 @@ jobs:
   #first Job
   run-shell-command:
     runs-on: ubuntu-latest
+    env:
+      JOB_VARIABLE: this is a workflow job
     steps:
         - name: echo a string
           run: |
             echo "Hello World"
+            echo "The Job Description is ${JOB_VARIABLE}"
             echo $GITHUB_REPOSITORY
             echo "Hello Mars"
             echo "Hello Jupiter"
