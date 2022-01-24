@@ -6,6 +6,8 @@ on:
   push:
   pull_request:
    types: [closed,assigned,opened,reopened]
+env:
+  WF_VARIABLE: this is a sample workflow
 jobs:
   #first Job
   run-shell-command:
@@ -14,10 +16,14 @@ jobs:
       JOB_VARIABLE: this is a workflow job
     steps:
         - name: echo a string
+          env:
+            STEP_VARIABLE: this is a step in the job
           run: |
             echo "Hello World"
+            echo "The Workflow Description is '${WF_VARIABLE}'"
             echo "The Job Description is '${JOB_VARIABLE}'"
-            echo "The Code Repository is '${GITHUB_REPOSITORY}'""
+            echo "The Step Description is '${STEP_VARIABLE}'"
+            echo "The Code Repository is '${GITHUB_REPOSITORY}'"
             echo "Hello Mars"
             echo "Hello Jupiter"
             echo "Hello Old Jupiter"
