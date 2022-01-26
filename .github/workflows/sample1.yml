@@ -46,5 +46,18 @@ jobs:
       - name: Directory Bash
         run: pwd
         shell: bash
+  
+  run-decryption:
+    #thirdjob
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - name: decrpting file
+        run: gpg --quite --batch --yes --decrypt --passphrase = "$PASSPHRASE" --output $HOME/demo.json demo.json.gpg
+        env:
+         PASSPHRASE: ${{secrets.PASSPHRASE}}
+      - name: Print our file context
+        run: cat $HOME/demo.json
+
 
           
