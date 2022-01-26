@@ -87,7 +87,7 @@ jobs:
         if: success()
         run: echo ${WF_VARIABLE}
       - name: echo my Planet Name
-        if: faliure()
+        if: failure()
         run: echo "'${planetname}'"
         env:
           planetname: Earth
