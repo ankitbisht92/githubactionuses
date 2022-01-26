@@ -77,7 +77,7 @@ jobs:
       - name: Dump matrix context
         run: echo '${{ toJSON(matrix) }}'
   
-  if-demo:
+  condition-demo:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
