@@ -83,7 +83,7 @@ jobs:
     steps:
       - name: echo my Repository
         run: eccho ${GITHUB_REPOSITORY}
-      - name: echo my variable
+      - name: echo my new variable
         if: faliure()
         run: echo ${WF_VARIABLE}
       - name: echo my message
