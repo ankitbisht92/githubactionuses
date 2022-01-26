@@ -86,6 +86,11 @@ jobs:
       - name: echo my new variable
         if: success()
         run: echo ${WF_VARIABLE}
+      - name: echo my Planet Name
+        if: faliure()
+        run: echo "'${planetname}'"
+        env:
+          planetname: Earth
       - name: echo my message
         if: always()
         run: echo "Hello World"
