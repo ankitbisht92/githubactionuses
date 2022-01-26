@@ -59,6 +59,7 @@ jobs:
      # - name: Print our file context
      #   run: cat $HOME/demo.json
   
+  #this job would dump all the contexts been available
   dump_contexts_to_log:
     runs-on: ubuntu-latest
     steps:
@@ -75,6 +76,19 @@ jobs:
         run: echo '${{ toJSON(strategy) }}'
       - name: Dump matrix context
         run: echo '${{ toJSON(matrix) }}'
+  
+  if-demo:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: echo my Repository
+        run: eccho ${GITHUB_REPOSITORY}
+      - name: echo my variable
+        if: faliure()
+        run: echo ${WF_VARIABLE}
+      - name: echo my message
+        if: always()
+        run: echo "Hello World"
 
 
           
