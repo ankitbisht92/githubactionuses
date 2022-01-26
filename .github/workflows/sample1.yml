@@ -84,7 +84,7 @@ jobs:
       - name: echo my Repository
         run: eccho ${GITHUB_REPOSITORY}
       - name: echo my new variable
-        if: failure()
+        if: success()
         run: echo ${WF_VARIABLE}
       - name: echo my message
         if: always()
