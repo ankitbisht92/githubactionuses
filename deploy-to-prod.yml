@@ -1,0 +1,1816 @@
+name: "Deploy to production"
+
+on:
+  push:
+    branches:
+      - master
+
+concurrency: prod_deployment
+
+env:
+  LAUNCH_DARKLY_CLIENT_ID_STAGING: 6172d01e9ab1852573c04f92
+  LAUNCH_DARKLY_CLIENT_ID_PRODUCTION: 616d6d0f7be9f424eb49c3c7
+
+jobs:
+  build_cache:
+    name: "Build caches"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Set cache metadata"
+        id: cache-meta
+        run: |
+          echo "::set-output name=key::${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}"
+          echo "::set-output name=yarn-path::$(yarn config get cacheFolder)"
+          echo "::set-output name=modules-path::**/node_modules"
+
+      - name: "Check for existing yarn cache"
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Check for existing node modules cache"
+        uses: actions/cache@v2
+        id: node-modules-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Install missing dependencies"
+        if: ${{ steps.yarn-cache.outputs.cache-hit != 'true' || steps.node-modules-cache.outputs.cache-hit != 'true'}}
+        run: yarn install
+
+    outputs:
+      key: ${{ steps.cache-meta.outputs.key }}
+      yarn-path: ${{ steps.cache-meta.outputs.yarn-path }}
+      modules-path: ${{ steps.cache-meta.outputs.modules-path }}
+
+  build_windows_cache:
+    name: "Build windows caches"
+    runs-on: windows-latest
+    steps:
+      - name: "Enable long paths"
+        run: git config --system core.longpaths true
+
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Set cache metadata"
+        id: cache-meta
+        run: |
+          echo "::set-output name=key::${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}"
+          echo "::set-output name=yarn-path::$(yarn config get cacheFolder)"
+          echo "::set-output name=modules-path::**/node_modules"
+
+      - name: "Check for existing yarn cache"
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Check for existing node modules cache"
+        uses: actions/cache@v2
+        id: node-modules-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Install missing dependencies"
+        if: ${{ steps.yarn-cache.outputs.cache-hit != 'true' || steps.node-modules-cache.outputs.cache-hit != 'true'}}
+        run: yarn install
+
+    outputs:
+      key: ${{ steps.cache-meta.outputs.key }}
+      yarn-path: ${{ steps.cache-meta.outputs.yarn-path }}
+      modules-path: ${{ steps.cache-meta.outputs.modules-path }}
+
+  compute_environment_prefix:
+    name: "Compute environment prefix"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Get commit SHA"
+        id: get-commit-sha
+        run: echo ::set-output name=commit-sha::$( git log -1 --format="%h" )
+
+    outputs:
+      site_version: ${{ steps.get-commit-sha.outputs.commit-sha }}
+      environment_prefix: prod-${{ steps.get-commit-sha.outputs.commit-sha }}
+
+  package_function_apps:
+    name: "Package Function Apps"
+    runs-on: ubuntu-latest
+    needs:
+      - build_cache
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Run unit tests"
+        run: yarn all:fa:test
+
+      - name: "Remove everything except runtime dependencies of function apps from node_modules"
+        run: |
+          yarn workspaces focus --production @tsw/function-app-features @tsw/function-app-projections @tsw/function-app-returns
+
+      - name: "Build and create function app zips"
+        run: yarn all:fa:build:zip
+
+      - name: "Collect function apps"
+        run: |
+          mkdir -p ./function-app-zips
+          yarn all:fa:copy-zip
+
+      - name: "Upload function app packages"
+        uses: actions/upload-artifact@v2
+        with:
+          name: function-app-zips
+          path: function-app-zips
+          if-no-files-found: error
+
+    outputs:
+      artifact-name: "function-app-zips"
+
+  deploy_staging_rg_terraform:
+    name: "Deploy Staging Resource Group"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/resource_group
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        id: rg-plan
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -out="staging-rg-plan.tfplan"
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            staging-rg-plan.tfplan
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > staging-rg-outputs.json
+          echo ::set-output name=resource-group-name::$( jq -r .resource_group_name.value staging-rg-outputs.json )
+          echo ::set-output name=artifact-storage-account-name::$( jq -r .artifact_storage_account_name.value staging-rg-outputs.json )
+          echo ::set-output name=artifact-container-name::$( jq -r .artifact_container_name.value staging-rg-outputs.json )
+          echo ::set-output name=test-artifacts-container-name::$( jq -r .test_artifacts_container_name.value staging-rg-outputs.json )
+
+    outputs:
+      resource_group_name: ${{ steps.set-terraform-outputs.outputs.resource-group-name }}
+      artifact_storage_account_name: ${{ steps.set-terraform-outputs.outputs.artifact-storage-account-name }}
+      artifact_container_name: ${{ steps.set-terraform-outputs.outputs.artifact-container-name }}
+      test_artifacts_container_name: ${{ steps.set-terraform-outputs.outputs.test-artifacts-container-name }}
+
+  deploy_staging_apim_terraform:
+    name: "Deploy Staging APIM"
+    needs: [ deploy_staging_rg_terraform ]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/apim
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -out="staging-apim-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_myaccount_signing_key: ${{ secrets.NON_PROD_MYACCOUNTS_SIGNING_KEY}}
+          TF_VAR_xplan_username: ${{ secrets.NON_PROD_XPLAN_USERNAME}}
+          TF_VAR_xplan_password: ${{ secrets.NON_PROD_XPLAN_PASSWORD}}
+          TF_VAR_myaccount_guest_username: ${{ secrets.MYACCOUNT_GUEST_USERNAME}}
+          TF_VAR_myaccount_guest_password: ${{ secrets.MYACCOUNT_GUEST_PASSWORD}}
+          TF_VAR_xplan_app_id: ${{ secrets.NON_PROD_XPLAN_APP_ID}}
+          TF_VAR_slack_security_alert_webhook_url: ${{ secrets.SLACK_SECURITY_ALERT_WEBHOOK_URL }}
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            staging-apim-plan.tfplan
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > staging-apim-outputs.json
+          echo ::set-output name=apim-name::$( jq -r .apim_name.value staging-apim-outputs.json )
+          echo ::set-output name=apim-vnet-name::$( jq -r .apim_vnet_name.value staging-apim-outputs.json )
+          echo ::set-output name=apim-subnet-name::$( jq -r .apim_subnet_name.value staging-apim-outputs.json )
+          echo ::set-output name=cdn-profile-website-name::$( jq -r .cdn_profile_website_name.value staging-apim-outputs.json )
+          echo ::set-output name=cdn-profile-storybook-name::$( jq -r .cdn_profile_storybook_name.value staging-apim-outputs.json )
+          echo ::set-output name=app-insights-name::$( jq -r .app_insights_name.value staging-apim-outputs.json )
+          echo ::set-output name=app-insights-connection-string::$( jq -r .app_insights_connection_string.value staging-apim-outputs.json )
+          echo ::set-output name=version-set-id::$( jq -r .version_set_id.value staging-apim-outputs.json )
+
+    outputs:
+      apim_name: ${{ steps.set-terraform-outputs.outputs.apim-name }}
+      apim_vnet_name: ${{ steps.set-terraform-outputs.outputs.apim-vnet-name }}
+      apim_subnet_name: ${{ steps.set-terraform-outputs.outputs.apim-subnet-name }}
+      cdn_profile_website_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-website-name }}
+      cdn_profile_storybook_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-storybook-name }}
+      app_insights_name: ${{ steps.set-terraform-outputs.outputs.app-insights-name }}
+      app_insights_connection_string: ${{ steps.set-terraform-outputs.outputs.app-insights-connection-string }}
+      version_set_id: ${{ steps.set-terraform-outputs.outputs.version-set-id }}
+
+  deploy_staging_frontend_terraform:
+    name: "Deploy Staging Frontend Infrastructure."
+    needs:
+      - deploy_staging_rg_terraform
+      - deploy_staging_apim_terraform
+      - package_function_apps
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Validate"
+        working-directory: ./terraform/frontend
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -out="staging-frontend-infra-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_apim_name: ${{ needs.deploy_staging_apim_terraform.outputs.apim_name }}
+          TF_VAR_cdn_profile_website_name: ${{ needs.deploy_staging_apim_terraform.outputs.cdn_profile_website_name }}
+          TF_VAR_cdn_profile_storybook_name: ${{ needs.deploy_staging_apim_terraform.outputs.cdn_profile_storybook_name }}
+          TF_VAR_app_insights_name: ${{ needs.deploy_staging_apim_terraform.outputs.app_insights_name }}
+          TF_VAR_git_branch_name: ${{ github.head_ref }}
+
+      - name: "Terraform Apply"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            staging-frontend-infra-plan.tfplan
+
+      - name: "Get Terraform Outputs"
+        id: get-terraform-outputs
+        working-directory: ./terraform/frontend
+        run: |
+          terraform output -json > staging-infra-outputs.json
+          echo ::set-output name=frontend-storage-account-name::$( jq -r .frontend_storage_account_name.value staging-infra-outputs.json )
+          echo ::set-output name=frontend-web-host::$( jq -r .frontend_web_host.value staging-infra-outputs.json )
+          echo ::set-output name=website-endpoint::$( jq -r .frontend_web_endpoint.value staging-infra-outputs.json )
+          echo ::set-output name=website-cdn-endpoint-name::$( jq -r .frontend_cdn_endpoint_name.value staging-infra-outputs.json )
+          echo ::set-output name=website-cname::$( jq -r .frontend_web_cname.value staging-infra-outputs.json )
+          echo ::set-output name=storybook-web-endpoint::$( jq -r .storybook_web_endpoint.value staging-infra-outputs.json )
+          echo ::set-output name=storybook-cdn-endpoint-name::$( jq -r .storybook_cdn_endpoint_name.value staging-infra-outputs.json )
+          echo ::set-output name=storybook-storage-account-name::$( jq -r .storybook_storage_account_name.value staging-infra-outputs.json )
+          echo ::set-output name=myaccounts-home-url::$( jq -r .myaccounts_home_url.value staging-infra-outputs.json )
+          echo ::set-output name=bestinvest-investment-search-url::$( jq -r .bestinvest_investment_search_url.value staging-infra-outputs.json )
+          echo ::set-output name=gtm-env-auth::$( jq -r .gtm_env_auth.value staging-infra-outputs.json )
+          echo ::set-output name=gtm-env-preview::$( jq -r .gtm_env_preview.value staging-infra-outputs.json )
+
+    outputs:
+      frontend_storage_account_name: ${{ steps.get-terraform-outputs.outputs.frontend-storage-account-name }}
+      frontend_web_host: ${{ steps.get-terraform-outputs.outputs.frontend-web-host }}
+      website_cname: ${{ steps.get-terraform-outputs.outputs.website-cname }}
+      website_endpoint: ${{ steps.get-terraform-outputs.outputs.website-endpoint }}
+      website_cdn_endpoint_name: ${{ steps.get-terraform-outputs.outputs.website-cdn-endpoint-name }}
+      storybook_storage_account_name: ${{ steps.get-terraform-outputs.outputs.storybook-storage-account-name }}
+      storybook_web_endpoint: ${{ steps.get-terraform-outputs.outputs.storybook-web-endpoint }}
+      storybook_cdn_endpoint_name: ${{ steps.get-terraform-outputs.outputs.storybook-cdn-endpoint-name }}
+      myaccounts_home_url: ${{ steps.get-terraform-outputs.outputs.myaccounts-home-url }}
+      bestinvest_investment_search_url: ${{ steps.get-terraform-outputs.outputs.bestinvest-investment-search-url }}
+      gtm_env_auth: ${{ steps.get-terraform-outputs.outputs.gtm-env-auth }}
+      gtm_env_preview: ${{ steps.get-terraform-outputs.outputs.gtm-env-preview }}
+
+  deploy_staging_backend_terraform:
+    name: "Deploy Staging Backend Infrastructure."
+    needs:
+      - deploy_staging_rg_terraform
+      - deploy_staging_apim_terraform
+      - package_function_apps
+      - deploy_staging_frontend_terraform
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Download function app zips"
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ needs.package_function_apps.outputs.artifact-name }}
+          path: ./terraform/backend/zips
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        working-directory: ./terraform/backend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Plan"
+        working-directory: ./terraform/backend
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -out="staging-backend-infra-plan.tfplan"
+        env:
+          TF_VAR_apim_name: ${{ needs.deploy_staging_apim_terraform.outputs.apim_name }}
+          TF_VAR_apim_subnet_name: ${{ needs.deploy_staging_apim_terraform.outputs.apim_subnet_name }}
+          TF_VAR_apim_vnet_name: ${{ needs.deploy_staging_apim_terraform.outputs.apim_vnet_name }}
+          TF_VAR_app_insights_name: ${{ needs.deploy_staging_apim_terraform.outputs.app_insights_name }}
+          TF_VAR_frontend_cdn_url: ${{ needs.deploy_staging_frontend_terraform.outputs.website_endpoint }}
+          TF_VAR_git_branch_name: ${{ github.head_ref }}
+          TF_VAR_resource_group_name: ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_myaccounts_aes_key: ${{ secrets.MYACCOUNTS_AES_KEY }}
+          TF_VAR_myaccounts_aes_key_vector: ${{ secrets.MYACCOUNTS_AES_KEY_VECTOR }}
+          TF_VAR_version_set_id: ${{ needs.deploy_staging_apim_terraform.outputs.version_set_id }}
+
+      - name: "Terraform Apply"
+        working-directory: ./terraform/backend
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            staging-backend-infra-plan.tfplan
+
+      - name: "Get Terraform Outputs"
+        id: get-terraform-outputs
+        working-directory: ./terraform/backend
+        run: |
+          terraform output -json > staging-infra-outputs.json
+          echo ::set-output name=api-base-url::$( jq -r .api_base_url.value staging-infra-outputs.json )
+          echo ::set-output name=api-endpoints::$( jq -r .api_endpoints.value staging-infra-outputs.json )
+
+    outputs:
+      api_base_url: ${{ steps.get-terraform-outputs.outputs.api-base-url }}
+      api_endpoints: ${{ steps.get-terraform-outputs.outputs.api-endpoints }}
+
+  open_staging_storage_account_firewalls:
+    name: "Open storage account firewalls for uploads"
+    runs-on: ubuntu-latest
+    needs: [ deploy_staging_rg_terraform, deploy_staging_frontend_terraform ]
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Set default rule to allow to enable uploads"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage account update --resource-group ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }} --name ${{ needs.deploy_staging_frontend_terraform.outputs.storybook_storage_account_name }} --default-action Allow
+            az storage account update --resource-group ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }} --name ${{ needs.deploy_staging_frontend_terraform.outputs.frontend_storage_account_name }} --default-action Allow
+
+  deploy_staging_frontend:
+    name: "Deploy staging front end"
+    needs:
+      - build_cache
+      - deploy_staging_rg_terraform
+      - deploy_staging_apim_terraform
+      - deploy_staging_frontend_terraform
+      - deploy_staging_backend_terraform
+      - open_staging_storage_account_firewalls
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Create env file"
+        working-directory: ./packages/hybrid-frontend
+        run: |
+          touch .env.staging
+          echo 'API_ENDPOINTS=${{ needs.deploy_staging_backend_terraform.outputs.api_endpoints }}' >> .env.staging
+          echo 'API_BASE_URL=${{ needs.deploy_staging_backend_terraform.outputs.api_base_url }}' >> .env.staging
+          echo 'MYACCOUNTS_HOME_URL=${{ needs.deploy_staging_frontend_terraform.outputs.myaccounts_home_url }}' >> .env.staging
+          echo 'BESTINVEST_INVESTMENT_SEARCH_URL=https://webalpha.bi-digital.co.uk/investment-search' >> .env.staging
+          echo 'GTM_AUTH=${{ needs.deploy_staging_frontend_terraform.outputs.gtm_env_auth }}' >> .env.staging
+          echo 'GTM_PREVIEW=${{ needs.deploy_staging_frontend_terraform.outputs.gtm_env_preview }}' >> .env.staging
+          echo 'AI_CONNECTION_STRING=${{ needs.deploy_staging_apim_terraform.outputs.app_insights_connection_string }}' >> .env.staging
+          echo "SITE_VERSION=$(git rev-parse --short HEAD)" >> .env.staging
+          echo 'LAUNCH_DARKLY_CLIENT_ID=${{ env.LAUNCH_DARKLY_CLIENT_ID_STAGING }}' >> .env.staging
+          cat .env.staging
+
+      - name: "Gatsby Build"
+        run: GATSBY_ACTIVE_ENV=staging yarn frontend build
+
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      # TODO check timings of uploads and parelellise if necessary
+      - name: "Upload build artifacts"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob upload-batch \
+              --source $GITHUB_WORKSPACE/packages/hybrid-frontend/public \
+              --destination "${{needs.deploy_staging_rg_terraform.outputs.artifact_container_name}}" \
+              --account-name "${{needs.deploy_staging_rg_terraform.outputs.artifact_storage_account_name}}" \
+              --destination-path "${{github.sha}}/"
+
+      - name: "Deploy Gatsby static website"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage container create --name '$web' --account-name "${{ needs.deploy_staging_frontend_terraform.outputs.frontend_storage_account_name }}"
+            az storage blob delete-batch --account-name "${{ needs.deploy_staging_frontend_terraform.outputs.frontend_storage_account_name }}" --source '$web'
+            az storage blob upload-batch -s $GITHUB_WORKSPACE/packages/hybrid-frontend/public -d "\$web" --account-name "${{ needs.deploy_staging_frontend_terraform.outputs.frontend_storage_account_name }}"
+
+  deploy_storybook:
+    name: "Deploy Storybook"
+    needs:
+      - build_cache
+      - deploy_staging_apim_terraform
+      - deploy_staging_frontend_terraform
+      - deploy_staging_backend_terraform
+      - open_staging_storage_account_firewalls
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Create env file"
+        working-directory: ./packages/hybrid-frontend
+        run: |
+          touch .env.production
+          echo 'API_ENDPOINTS=${{ needs.deploy_staging_backend_terraform.outputs.api_endpoints }}' >> .env.production
+          echo 'API_BASE_URL=${{ needs.deploy_staging_backend_terraform.outputs.api_base_url }}' >> .env.production
+          echo 'MYACCOUNTS_HOME_URL=${{ needs.deploy_staging_frontend_terraform.outputs.myaccounts_home_url }}' >> .env.production
+          echo 'BESTINVEST_INVESTMENT_SEARCH_URL=https://webalpha.bi-digital.co.uk/investment-search' >> .env.production
+          echo 'GTM_AUTH=${{ needs.deploy_staging_frontend_terraform.outputs.gtm_env_auth }}' >> .env.production
+          echo 'GTM_PREVIEW=${{ needs.deploy_staging_frontend_terraform.outputs.gtm_env_preview }}' >> .env.production
+          echo 'AI_CONNECTION_STRING=${{ needs.deploy_staging_apim_terraform.outputs.app_insights_connection_string }}' >> .env.production
+          cat .env.production
+
+      - name: "Build Storybook"
+        run: GATSBY_ACTIVE_ENV=production yarn build-storybook -o "./storybook-static"
+
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Deploy Storybook as static website"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage container create --name '$web' --account-name "${{ needs.deploy_staging_frontend_terraform.outputs.storybook_storage_account_name }}"
+            az storage blob delete-batch --account-name "${{ needs.deploy_staging_frontend_terraform.outputs.storybook_storage_account_name }}" --source '$web'
+            az storage blob upload-batch -s $GITHUB_WORKSPACE/packages/hybrid-frontend/storybook-static -d "\$web" --account-name "${{ needs.deploy_staging_frontend_terraform.outputs.storybook_storage_account_name }}"
+
+  purge_storybook_cdn_cache:
+    name: "Purge storybook CDN cache"
+    if: needs.deploy_storybook.result == 'success'
+    runs-on: ubuntu-latest
+    needs:
+      - deploy_staging_rg_terraform
+      - deploy_staging_apim_terraform
+      - deploy_staging_frontend_terraform
+      - deploy_storybook
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Purge storybook CDN cache"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az cdn endpoint purge --resource-group ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }} --name ${{needs.deploy_staging_frontend_terraform.outputs.storybook_cdn_endpoint_name}} --profile-name ${{ needs.deploy_staging_apim_terraform.outputs.cdn_profile_storybook_name }} --content-paths '/*'
+
+  deploy_staging_front_door:
+    name: "Deploy staging Front Door"
+    needs:
+      - deploy_staging_rg_terraform
+      - deploy_staging_frontend_terraform
+      - deploy_staging_frontend
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        working-directory: ./terraform/front_door
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Plan"
+        working-directory: ./terraform/front_door
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -out="staging-fd-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_cdn_endpoint_host: ${{ needs.deploy_staging_frontend_terraform.outputs.frontend_web_host }}
+
+      - name: "Terraform Apply"
+        working-directory: ./terraform/front_door
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            staging-fd-plan.tfplan
+
+  close_staging_storage_account_firewalls:
+    name: "Close storage account firewalls for uploads"
+    runs-on: ubuntu-latest
+    needs:
+      - deploy_staging_rg_terraform
+      - deploy_staging_frontend_terraform
+      - deploy_staging_frontend
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Set default rule to allow to enable uploads"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage account update --resource-group ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }} --name ${{ needs.deploy_staging_frontend_terraform.outputs.storybook_storage_account_name }} --default-action Deny
+            az storage account update --resource-group ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }} --name ${{ needs.deploy_staging_frontend_terraform.outputs.frontend_storage_account_name }} --default-action Deny
+
+
+  purge_staging_frontend_cdn_cache:
+    name: "Purge staging frontend CDN cache"
+    if: needs.deploy_staging_frontend.result == 'success'
+    runs-on: ubuntu-latest
+    needs:
+      - deploy_staging_rg_terraform
+      - deploy_staging_apim_terraform
+      - deploy_staging_frontend_terraform
+      - deploy_staging_frontend
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Purge frontend CDN cache"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az cdn endpoint purge --resource-group ${{ needs.deploy_staging_rg_terraform.outputs.resource_group_name }} --name ${{needs.deploy_staging_frontend_terraform.outputs.website_cdn_endpoint_name}} --profile-name ${{ needs.deploy_staging_apim_terraform.outputs.cdn_profile_website_name }} --content-paths '/*'
+
+  deploy_production_rg_terraform:
+    name: "Deploy prod Resource Group"
+    needs: [ deploy_staging_front_door ]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/resource_group
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        id: rg-plan
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -out="prod-rg-plan.tfplan"
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            prod-rg-plan.tfplan
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > prod-rg-outputs.json
+          echo ::set-output name=resource-group-name::$( jq -r .resource_group_name.value prod-rg-outputs.json )
+          echo ::set-output name=artifact-storage-account-name::$( jq -r .artifact_storage_account_name.value prod-rg-outputs.json )
+          echo ::set-output name=artifact-container-name::$(  jq -r .artifact_container_name.value prod-rg-outputs.json )
+          echo ::set-output name=test-artifacts-container-name::$( jq -r .test_artifacts_container_name.value prod-rg-outputs.json )
+
+    outputs:
+      resource_group_name: ${{ steps.set-terraform-outputs.outputs.resource-group-name }}
+      artifact_storage_account_name: ${{ steps.set-terraform-outputs.outputs.artifact-storage-account-name }}
+      artifact_container_name: ${{ steps.set-terraform-outputs.outputs.artifact-container-name }}
+      test_artifacts_container_name: ${{ steps.set-terraform-outputs.outputs.test-artifacts-container-name }}
+
+  deploy_production_apim_terraform:
+    name: "Deploy prod APIM"
+    needs: [ deploy_production_rg_terraform ]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/apim
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -out="prod-apim-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.deploy_production_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_myaccount_signing_key: ${{ secrets.PROD_MYACCOUNTS_SIGNING_KEY}}
+          TF_VAR_xplan_username: ${{ secrets.PROD_XPLAN_USERNAME}}
+          TF_VAR_xplan_password: ${{ secrets.PROD_XPLAN_PASSWORD}}
+          TF_VAR_myaccount_guest_username: ${{ secrets.MYACCOUNT_GUEST_USERNAME}}
+          TF_VAR_myaccount_guest_password: ${{ secrets.MYACCOUNT_GUEST_PASSWORD}}
+          TF_VAR_xplan_app_id: ${{ secrets.PROD_XPLAN_APP_ID}}
+          TF_VAR_slack_security_alert_webhook_url: ${{ secrets.SLACK_SECURITY_ALERT_WEBHOOK_URL }}
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            prod-apim-plan.tfplan
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > prod-apim-outputs.json
+          echo ::set-output name=apim-name::$( jq -r .apim_name.value prod-apim-outputs.json )
+          echo ::set-output name=apim-vnet-name::$( jq -r .apim_vnet_name.value prod-apim-outputs.json )
+          echo ::set-output name=apim-subnet-name::$( jq -r .apim_subnet_name.value prod-apim-outputs.json )
+          echo ::set-output name=cdn-profile-website-name::$( jq -r .cdn_profile_website_name.value prod-apim-outputs.json )
+          echo ::set-output name=cdn-profile-storybook-name::$( jq -r .cdn_profile_storybook_name.value prod-apim-outputs.json )
+          echo ::set-output name=app-insights-name::$( jq -r .app_insights_name.value prod-apim-outputs.json )
+          echo ::set-output name=app-insights-connection-string::$( jq -r .app_insights_connection_string.value prod-apim-outputs.json )
+          echo ::set-output name=version-set-id::$( jq -r .version_set_id.value prod-apim-outputs.json )
+
+    outputs:
+      apim_name: ${{ steps.set-terraform-outputs.outputs.apim-name }}
+      apim_vnet_name: ${{ steps.set-terraform-outputs.outputs.apim-vnet-name }}
+      apim_subnet_name: ${{ steps.set-terraform-outputs.outputs.apim-subnet-name }}
+      cdn_profile_website_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-website-name }}
+      cdn_profile_storybook_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-storybook-name }}
+      app_insights_name: ${{ steps.set-terraform-outputs.outputs.app-insights-name }}
+      app_insights_connection_string: ${{ steps.set-terraform-outputs.outputs.app-insights-connection-string }}
+      version_set_id: ${{ steps.set-terraform-outputs.outputs.version-set-id }}
+
+  deploy_canary_frontend_terraform:
+    name: "Deploy prod frontend infrastructure"
+    needs:
+      - deploy_production_rg_terraform
+      - deploy_production_apim_terraform
+      - compute_environment_prefix
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend" \
+            -backend-config="key=infra/${{ needs.compute_environment_prefix.outputs.environment_prefix }}.tfstate"
+
+      - name: "Terraform Validate"
+        working-directory: ./terraform/frontend
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -out="prod-infra-plan.tfplan"
+        env:
+          TF_VAR_environment_prefix: ${{ needs.compute_environment_prefix.outputs.environment_prefix }}
+          TF_VAR_resource_group_name: ${{ needs.deploy_production_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_apim_name: ${{ needs.deploy_production_apim_terraform.outputs.apim_name }}
+          TF_VAR_cdn_profile_website_name: ${{ needs.deploy_production_apim_terraform.outputs.cdn_profile_website_name }}
+          TF_VAR_cdn_profile_storybook_name: ${{ needs.deploy_production_apim_terraform.outputs.cdn_profile_storybook_name }}
+          TF_VAR_app_insights_name: ${{ needs.deploy_production_apim_terraform.outputs.app_insights_name }}
+          TF_VAR_git_branch_name: ${{ github.head_ref }}
+
+      - name: "Terraform Apply"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            prod-infra-plan.tfplan
+
+      - name: "Get Terraform Outputs"
+        id: get-terraform-outputs
+        working-directory: ./terraform/frontend
+        run: |
+          terraform output -json > prod-infra-outputs.json
+          echo ::set-output name=frontend-storage-account-name::$( jq -r .frontend_storage_account_name.value prod-infra-outputs.json )
+          echo ::set-output name=frontend-web-host::$( jq -r .frontend_web_host.value prod-infra-outputs.json )
+          echo ::set-output name=website-endpoint::$( jq -r .frontend_web_endpoint.value prod-infra-outputs.json )
+          echo ::set-output name=website-cdn-endpoint-name::$( jq -r .frontend_cdn_endpoint_name.value prod-infra-outputs.json )
+          echo ::set-output name=website-cname::$( jq -r .frontend_web_cname.value prod-infra-outputs.json )
+          echo ::set-output name=myaccounts-home-url::$( jq -r .myaccounts_home_url.value prod-infra-outputs.json )
+          echo ::set-output name=bestinvest-investment-search-url::$( jq -r .bestinvest_investment_search_url.value prod-infra-outputs.json )
+          echo ::set-output name=gtm-env-auth::$( jq -r .gtm_env_auth.value prod-infra-outputs.json )
+          echo ::set-output name=gtm-env-preview::$( jq -r .gtm_env_preview.value prod-infra-outputs.json )
+
+    outputs:
+      frontend_storage_account_name: ${{ steps.get-terraform-outputs.outputs.frontend-storage-account-name }}
+      frontend_web_host: ${{ steps.get-terraform-outputs.outputs.frontend-web-host }}
+      website_endpoint: ${{ steps.get-terraform-outputs.outputs.website-endpoint }}
+      website_cdn_endpoint_name: ${{ steps.get-terraform-outputs.outputs.website-cdn-endpoint-name }}
+      website_cname: ${{ steps.get-terraform-outputs.outputs.website-cname }}
+      myaccounts_home_url: ${{ steps.get-terraform-outputs.outputs.myaccounts-home-url }}
+      bestinvest_investment_search_url: ${{ steps.get-terraform-outputs.outputs.bestinvest-investment-search-url }}
+      gtm_env_auth: ${{ steps.get-terraform-outputs.outputs.gtm-env-auth }}
+      gtm_env_preview: ${{ steps.get-terraform-outputs.outputs.gtm-env-preview }}
+
+  deploy_canary_backend_terraform:
+    name: "Deploy prod backend infrastructure"
+    needs:
+      - deploy_production_rg_terraform
+      - deploy_production_apim_terraform
+      - package_function_apps
+      - compute_environment_prefix
+      - deploy_canary_frontend_terraform
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Download function app zips"
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ needs.package_function_apps.outputs.artifact-name }}
+          path: ./terraform/backend/zips
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        working-directory: ./terraform/backend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend" \
+            -backend-config="key=infra/${{ needs.compute_environment_prefix.outputs.environment_prefix }}-backend.tfstate"
+
+      - name: "Terraform Validate"
+        working-directory: ./terraform/backend
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        working-directory: ./terraform/backend
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -out="prod-infra-plan.tfplan"
+        env:
+          TF_VAR_apim_name: ${{ needs.deploy_production_apim_terraform.outputs.apim_name }}
+          TF_VAR_apim_vnet_name: ${{ needs.deploy_production_apim_terraform.outputs.apim_vnet_name }}
+          TF_VAR_apim_subnet_name: ${{ needs.deploy_production_apim_terraform.outputs.apim_subnet_name }}
+          TF_VAR_app_insights_name: ${{ needs.deploy_production_apim_terraform.outputs.app_insights_name }}
+          TF_VAR_environment_prefix: ${{ needs.compute_environment_prefix.outputs.environment_prefix }}
+          TF_VAR_frontend_cdn_url: ${{ needs.deploy_canary_frontend_terraform.outputs.website_endpoint }}
+          TF_VAR_git_branch_name: ${{ github.head_ref }}
+          TF_VAR_resource_group_name: ${{ needs.deploy_production_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_myaccounts_aes_key: ${{ secrets.MYACCOUNTS_AES_KEY }}
+          TF_VAR_myaccounts_aes_key_vector: ${{ secrets.MYACCOUNTS_AES_KEY_VECTOR }}
+          TF_VAR_version_set_id: ${{ needs.deploy_production_apim_terraform.outputs.version_set_id }}
+
+      - name: "Terraform Apply"
+        working-directory: ./terraform/backend
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            prod-infra-plan.tfplan
+
+      - name: "Get Terraform Outputs"
+        id: get-terraform-outputs
+        working-directory: ./terraform/backend
+        run: |
+          terraform output -json > prod-infra-outputs.json
+          echo ::set-output name=api-base-url::$( jq -r .api_base_url.value prod-infra-outputs.json )
+          echo ::set-output name=api-endpoints::$( jq -r .api_endpoints.value prod-infra-outputs.json )
+
+    outputs:
+      api_base_url: ${{ steps.get-terraform-outputs.outputs.api-base-url }}
+      api_endpoints: ${{ steps.get-terraform-outputs.outputs.api-endpoints }}
+
+  open_prod_storage_account_firewalls:
+    name: "Open storage account firewalls for uploads"
+    runs-on: ubuntu-latest
+    needs: [ deploy_production_rg_terraform, deploy_canary_frontend_terraform ]
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.PROD_AZURE_CREDENTIALS }}
+
+      - name: "Set default rule to allow to enable uploads"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage account update --resource-group ${{ needs.deploy_production_rg_terraform.outputs.resource_group_name }} --name ${{ needs.deploy_canary_frontend_terraform.outputs.frontend_storage_account_name }} --default-action Allow
+
+  deploy_canary_frontend:
+    name: "Deploy prod canary front end"
+    needs:
+      - build_cache
+      - deploy_production_rg_terraform
+      - deploy_production_apim_terraform
+      - deploy_canary_frontend_terraform
+      - deploy_canary_backend_terraform
+      - open_prod_storage_account_firewalls
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Create env file"
+        working-directory: ./packages/hybrid-frontend
+        run: |
+          touch .env.production
+          echo 'API_ENDPOINTS=${{ needs.deploy_canary_backend_terraform.outputs.api_endpoints }}' >> .env.production
+          echo 'API_BASE_URL=${{ needs.deploy_canary_backend_terraform.outputs.api_base_url }}' >> .env.production
+          echo 'MYACCOUNTS_HOME_URL=${{ needs.deploy_canary_frontend_terraform.outputs.myaccounts_home_url }}' >> .env.production
+          echo 'BESTINVEST_INVESTMENT_SEARCH_URL=https://webbeta.bestinvest.co.uk/investment-search' >> .env.production
+          echo 'GTM_AUTH=${{ needs.deploy_canary_frontend_terraform.outputs.gtm_env_auth }}' >> .env.production
+          echo 'GTM_PREVIEW=${{ needs.deploy_canary_frontend_terraform.outputs.gtm_env_preview }}' >> .env.production
+          echo 'AI_CONNECTION_STRING=${{ needs.deploy_production_apim_terraform.outputs.app_insights_connection_string }}' >> .env.production
+          echo "SITE_VERSION=$(git rev-parse --short HEAD)" >> .env.production
+          echo 'LAUNCH_DARKLY_CLIENT_ID=${{ env.LAUNCH_DARKLY_CLIENT_ID_PRODUCTION }}' >> .env.production
+          cat .env.production
+
+      - name: "Gatsby build"
+        timeout-minutes: 5
+        run: GATSBY_ACTIVE_ENV=production yarn frontend build
+
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.PROD_AZURE_CREDENTIALS }}
+
+      # TODO check timings of uploads and parelellise if necessary
+      - name: "Upload build artifacts"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob upload-batch \
+              --source $GITHUB_WORKSPACE/packages/hybrid-frontend/public \
+              --destination "${{needs.deploy_production_rg_terraform.outputs.artifact_container_name}}" \
+              --account-name "${{needs.deploy_production_rg_terraform.outputs.artifact_storage_account_name}}" \
+              --destination-path "${{github.sha}}/"
+
+      - name: "Deploy frontend as static website"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage container create --name '$web' --account-name "${{ needs.deploy_canary_frontend_terraform.outputs.frontend_storage_account_name }}"
+            az storage blob delete-batch --account-name "${{ needs.deploy_canary_frontend_terraform.outputs.frontend_storage_account_name }}" --source '$web'
+            az storage blob upload-batch -s $GITHUB_WORKSPACE/packages/hybrid-frontend/public -d "\$web" --account-name "${{ needs.deploy_canary_frontend_terraform.outputs.frontend_storage_account_name }}"
+
+  # TODO: Run tests against canary env?
+
+  deploy_production_front_door:
+    name: "Deploy prod Front Door"
+    needs:
+      - deploy_production_rg_terraform
+      - deploy_canary_frontend_terraform
+      - deploy_canary_frontend
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    defaults:
+      run:
+        working-directory: ./terraform/front_door
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend"
+
+      - name: "Terraform Plan"
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -out="prod-fd-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.deploy_production_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_cdn_endpoint_host: ${{ needs.deploy_canary_frontend_terraform.outputs.frontend_web_host }}
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            prod-fd-plan.tfplan
+
+      - name: "Get Terraform Outputs"
+        id: get-terraform-outputs
+        run: |
+          terraform output -json > prod-fd-outputs.json
+          echo "::set-output name=site-url::$( jq -r .site_url.value prod-fd-outputs.json )"
+
+    outputs:
+      site_url: ${{ steps.get-terraform-outputs.outputs.site-url }}
+
+  poll_site:
+    name: "Poll site for new version"
+    runs-on: ubuntu-latest
+    needs:
+      - compute_environment_prefix
+      - deploy_production_front_door
+    steps:
+      - name: "Poll site"
+        uses: crederauk/poll-site-version@v1
+        with:
+          site-url: ${{ needs.deploy_production_front_door.outputs.site_url }}
+          desired-version: ${{ needs.compute_environment_prefix.outputs.site_version }}
+          timeout: 1200 # 20 mins
+
+  find_version_to_destroy:
+    name: "Find version to destroy"
+    runs-on: ubuntu-latest
+    needs: [ compute_environment_prefix ]
+    steps:
+      - name: "Checkout repo"
+        uses: actions/checkout@v2
+
+      - name: "Restore prefix file"
+        id: restore-prefix-file
+        uses: actions/cache@v2
+        with:
+          path: last_successful_deploy_prefix.txt
+          key: last_successful_deploy_prefix-check-${{ needs.compute_environment_prefix.outputs.environment_prefix }}
+          restore-keys: |
+            last_successful_deploy_prefix-
+
+      - name: "Check if currently deployed"
+        id: check-deployed
+        run: |
+          if [[ ! -f last_successful_deploy_prefix.txt ]]; then
+            echo ::error title=Error restoring cache::Couldn\'t find version of prod to destroy
+            exit 1
+          fi
+          if [[ "$( cat last_successful_deploy_prefix.txt )" == "${{ needs.compute_environment_prefix.outputs.site_version }}" ]]; then
+            echo ::set-output name=should-destroy::false
+          else
+            echo ::set-output name=should-destroy::true
+          fi
+
+    outputs:
+      should_destroy: ${{ steps.check-deployed.outputs.should-destroy }}
+
+  destroy_old_terraform:
+    name: "Destroy old prod frontend infra"
+    runs-on: ubuntu-latest
+    if: needs.find_version_to_destroy.outputs.should_destroy == 'true'
+    needs:
+      - compute_environment_prefix
+      - deploy_production_rg_terraform
+      - deploy_production_apim_terraform
+      - poll_site
+      - find_version_to_destroy
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout repo"
+        uses: actions/checkout@v2
+
+      - name: "Restore prefix file"
+        id: restore-prefix-file
+        uses: actions/cache@v2
+        with:
+          path: last_successful_deploy_prefix.txt
+          key: last_successful_deploy_prefix-${{ needs.compute_environment_prefix.outputs.environment_prefix }}
+          restore-keys: |
+            last_successful_deploy_prefix-
+
+      - name: "Get prefix of last successful deploy"
+        id: get-prefix
+        run: |
+          if [[ ! -f last_successful_deploy_prefix.txt ]]; then
+            echo ::error title=Error restoring cache::Couldn\'t find version of prod to destroy
+            exit 1
+          fi
+          echo ::set-output name=environment-prefix::$( cat last_successful_deploy_prefix.txt )
+          echo ::set-output name=state-file::$( cat last_successful_deploy_prefix.txt )
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend" \
+            -backend-config="key=infra/${{ steps.get-prefix.outputs.state-file }}.tfstate"
+
+      - name: "Terraform Plan"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform plan \
+            -destroy \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -out="prod-infra-destroy-plan.tfplan"
+        env:
+          TF_VAR_environment_prefix: ${{ steps.get-prefix.outputs.environment-prefix }}
+          TF_VAR_resource_group_name: ${{ needs.deploy_production_rg_terraform.outputs.resource_group_name }}
+          TF_VAR_apim_name: ${{ needs.deploy_production_apim_terraform.outputs.apim_name }}
+          TF_VAR_cdn_profile_website_name: ${{ needs.deploy_production_apim_terraform.outputs.cdn_profile_website_name }}
+          TF_VAR_cdn_profile_storybook_name: ${{ needs.deploy_production_apim_terraform.outputs.cdn_profile_storybook_name }}
+          TF_VAR_app_insights_name: ${{ needs.deploy_production_apim_terraform.outputs.app_insights_name }}
+          TF_VAR_git_branch_name: ${{ github.head_ref }}
+
+      - name: "Terraform Destroy"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            prod-infra-destroy-plan.tfplan
+
+      - name: "Set last successful deploy"
+        run: echo "${{ needs.compute_environment_prefix.outputs.environment_prefix }}" > last_successful_deploy_prefix.txt
+
+  close_prod_storage_account_firewalls:
+    name: "Close storage account firewalls for uploads"
+    runs-on: ubuntu-latest
+    needs:
+      - deploy_production_rg_terraform
+      - deploy_canary_frontend_terraform
+      - deploy_canary_frontend
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.PROD_AZURE_CREDENTIALS }}
+
+      - name: "Set default rule to allow to deny uploads"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage account update --resource-group ${{ needs.deploy_production_rg_terraform.outputs.resource_group_name }} --name ${{ needs.deploy_canary_frontend_terraform.outputs.frontend_storage_account_name }} --default-action Deny
+
+  output_website_urls:
+    name: "Output website urls"
+    needs: [ deploy_staging_frontend_terraform, deploy_canary_frontend_terraform ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Get website urls"
+        shell: bash
+        run: |
+          echo "Staging website endpoint: ${{ needs.deploy_staging_frontend_terraform.outputs.website_endpoint }}"
+          echo "Staging website cname: ${{ needs.deploy_staging_frontend_terraform.outputs.website_cname }}"
+          echo "Staging Storybook endpoint: ${{ needs.deploy_staging_frontend_terraform.outputs.storybook_web_endpoint }}"
+          echo "Production website endpoint: ${{ needs.deploy_canary_frontend_terraform.outputs.website_endpoint }}"
+          echo "Production website cname: ${{ needs.deploy_canary_frontend_terraform.outputs.website_cname }}"
+
+  post-to-slack:
+    name: "Post to Slack"
+    if: always()
+    needs:
+      - build_cache
+      - build_windows_cache
+      - compute_environment_prefix
+      - package_function_apps
+      - deploy_staging_rg_terraform
+      - deploy_staging_apim_terraform
+      - deploy_staging_frontend_terraform
+      - deploy_staging_backend_terraform
+      - open_staging_storage_account_firewalls
+      - deploy_staging_frontend
+      - deploy_storybook
+      - purge_storybook_cdn_cache
+      - deploy_staging_front_door
+      - close_staging_storage_account_firewalls
+      - purge_staging_frontend_cdn_cache
+      - deploy_production_rg_terraform
+      - deploy_production_apim_terraform
+      - deploy_canary_frontend_terraform
+      - deploy_canary_backend_terraform
+      - open_prod_storage_account_firewalls
+      - deploy_canary_frontend
+      - deploy_production_front_door
+      - poll_site
+      - find_version_to_destroy
+      - destroy_old_terraform
+      - close_prod_storage_account_firewalls
+      - output_website_urls
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Set variables"
+        id: set-variables
+        run: |
+          echo ::set-output name=current-timestamp::$( date +%s )
+          if [[
+            "${{
+              needs.build_cache.result == 'success' &&
+              needs.build_windows_cache.result == 'success' &&
+              needs.compute_environment_prefix.result == 'success' &&
+              needs.package_function_apps.result == 'success' &&
+              needs.deploy_staging_rg_terraform.result == 'success' &&
+              needs.deploy_staging_apim_terraform.result == 'success' &&
+              needs.deploy_staging_frontend_terraform.result == 'success' &&
+              needs.deploy_staging_backend_terraform.result == 'success' &&
+              needs.open_staging_storage_account_firewalls.result == 'success' &&
+              needs.deploy_staging_frontend.result == 'success' &&
+              needs.deploy_storybook.result == 'success' &&
+              needs.purge_storybook_cdn_cache.result == 'success' &&
+              needs.deploy_staging_front_door.result == 'success' &&
+              needs.close_staging_storage_account_firewalls.result == 'success' &&
+              needs.purge_staging_frontend_cdn_cache.result == 'success' &&
+              needs.deploy_production_rg_terraform.result == 'success' &&
+              needs.deploy_production_apim_terraform.result == 'success' &&
+              needs.deploy_canary_frontend_terraform.result == 'success' &&
+              needs.deploy_canary_backend_terraform.result == 'success' &&
+              needs.open_prod_storage_account_firewalls.result == 'success' &&
+              needs.deploy_canary_frontend.result == 'success' &&
+              needs.deploy_production_front_door.result == 'success' &&
+              needs.poll_site.result == 'success' &&
+              needs.find_version_to_destroy.result == 'success' &&
+              needs.destroy_old_terraform.result == 'success' &&
+              needs.close_prod_storage_account_firewalls.result == 'success' &&
+              needs.output_website_urls.result == 'success'
+            }}" == "true"
+          ]]; then
+            echo ::set-output name=deployment-status::success
+          else
+            echo ::set-output name=deployment-status::failure
+          fi
+
+      - name: "Post to slack"
+        uses: 8398a7/action-slack@v3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.PROD_SLACK_WEBHOOK_URL }}
+        with:
+          status: custom
+          custom_payload: |
+            {
+              attachments: [{
+                "color": '${{ steps.set-variables.outputs.deployment-status }}' === 'success' ? '#009933' : '#cc0000',
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": '${{ steps.set-variables.outputs.deployment-status }}' === 'success' ? 'Deployment Success :rocket:' : 'Deployment Failed :rotating_light:',
+                      "emoji": true
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Workflow Name* : ${{ github.workflow }}"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Deployment initiated by*:"
+                      },
+                      {
+                        "type": "image",
+                        "image_url": "https://github.com/${{ github.actor }}.png?size=40",
+                        "alt_text": "Authors Avatar"
+                      },
+                      {
+                        "type": "plain_text",
+                        "text": "${{ github.actor }}",
+                        "emoji": true
+                      }
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ steps.set-variables.outputs.deployment-status }}' === 'success' ? ':heavy-check-mark:   *Deployment Status*: Success' : ':heavy-cross-mark:   *Deployment Status*: Failure'
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Job Conclusions for this workflow run.*"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.build_cache.result }}' === 'success' ? ':heavy-check-mark:   Build Cache' : '${{ needs.build_cache.result }}' === 'failure' ? ':heavy-cross-mark:   Build Cache' : ':heavy-minus-sign:   Build Cache'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.build_windows_cache.result }}' === 'success' ? ':heavy-check-mark:   Build Windows Cache' : '${{ needs.build_windows_cache.result }}' === 'failure' ? ':heavy-cross-mark:   Build Windows Cache' : ':heavy-minus-sign:   Build Windows Cache'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.compute_environment_prefix.result }}' === 'success' ? ':heavy-check-mark:   Compute environment prefix' : '${{ needs.compute_environment_prefix.result }}' === 'failure' ? ':heavy-cross-mark:   Compute environment prefix' : ':heavy-minus-sign:   Compute environment prefix'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.package_function_apps.result }}' === 'success' ? ':heavy-check-mark:   Package Function Apps' : '${{ needs.package_function_apps.result }}' === 'failure' ? ':heavy-cross-mark:   Package Function Apps' : ':heavy-minus-sign:   Package Function Apps'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_staging_rg_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Staging Resource Group' : '${{ needs.deploy_staging_rg_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Staging Resource Group' : ':heavy-minus-sign:   Deploy Staging Resource Group'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_staging_apim_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Staging APIM' : '${{ needs.deploy_staging_apim_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Staging APIM' : ':heavy-minus-sign:   Deploy Staging APIM'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_staging_frontend_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Staging Frontend Infra' : '${{ needs.deploy_staging_frontend_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Staging Frontend Infra' : ':heavy-minus-sign:   Deploy Staging Frontend Infra'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_staging_backend_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Staging Backend Infra' : '${{ needs.deploy_staging_backend_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Staging Backend Infra' : ':heavy-minus-sign:   Deploy Staging Backend Infra'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.open_staging_storage_account_firewalls.result }}' === 'success' ? ':heavy-check-mark:   Open Staging Storage Account Firewalls' : '${{ needs.open_staging_storage_account_firewalls.result }}' === 'failure' ? ':heavy-cross-mark:   Open Staging Storage Account Firewalls' : ':heavy-minus-sign:   Open Staging Storage Account Firewalls'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_staging_frontend.result }}' === 'success' ? ':heavy-check-mark:   Deploy Staging Frontend' : '${{ needs.deploy_staging_frontend.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Staging Frontend' : ':heavy-minus-sign:   Deploy Staging Frontend'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_storybook.result }}' === 'success' ? ':heavy-check-mark:   Deploy Storybook' : '${{ needs.deploy_storybook.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Storybook' : ':heavy-minus-sign:   Deploy Storybook'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.purge_storybook_cdn_cache.result }}' === 'success' ? ':heavy-check-mark:   Purge Storybook CDN Cache' : '${{ needs.purge_storybook_cdn_cache.result }}' === 'failure' ? ':heavy-cross-mark:   Purge Storybook CDN Cache' : ':heavy-minus-sign:   Purge Storybook CDN Cache'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_staging_front_door.result }}' === 'success' ? ':heavy-check-mark:   Deploy Staging Front Door' : '${{ needs.deploy_staging_front_door.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Staging Front Door' : ':heavy-minus-sign:   Deploy Staging Front Door'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.close_staging_storage_account_firewalls.result }}' === 'success' ? ':heavy-check-mark:   Close Staging Storage Account Firewalls' : '${{ needs.close_staging_storage_account_firewalls.result }}' === 'failure' ? ':heavy-cross-mark:   Close Staging Storage Account Firewalls' : ':heavy-minus-sign:   Close Staging Storage Account Firewalls'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.purge_staging_frontend_cdn_cache.result }}' === 'success' ? ':heavy-check-mark:   Purge Staging Frontend CDN Cache' : '${{ needs.purge_staging_frontend_cdn_cache.result }}' === 'failure' ? ':heavy-cross-mark:   Purge Staging Frontend CDN Cache' : ':heavy-minus-sign:   Purge Staging Frontend CDN Cache'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_production_rg_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Production Resource Group' : '${{ needs.deploy_production_rg_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Production Resource Group' : ':heavy-minus-sign:   Deploy Production Resource Group'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_production_apim_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Production APIM' : '${{ needs.deploy_production_apim_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Production APIM' : ':heavy-minus-sign:   Deploy Production APIM'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_canary_frontend_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Canary Frontend Infra' : '${{ needs.deploy_canary_frontend_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Canary Frontend Infra' : ':heavy-minus-sign:   Deploy Canary Frontend Infra'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_canary_backend_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Canary Backend Infra' : '${{ needs.deploy_canary_backend_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Canary Backend Infra' : ':heavy-minus-sign:   Deploy Canary Backend Infra'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.open_prod_storage_account_firewalls.result }}' === 'success' ? ':heavy-check-mark:   Open Prod Storage Account Firewalls' : '${{ needs.open_prod_storage_account_firewalls.result }}' === 'failure' ? ':heavy-cross-mark:   Open Prod Storage Account Firewalls' : ':heavy-minus-sign:   Open Prod Storage Account Firewalls'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_canary_frontend.result }}' === 'success' ? ':heavy-check-mark:   Deploy Canary Prod Frontend' : '${{ needs.deploy_canary_frontend.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Canary Prod Frontend' : ':heavy-minus-sign:   Deploy Canary Prod Frontend'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.deploy_production_front_door.result }}' === 'success' ? ':heavy-check-mark:   Deploy Prod Front Door' : '${{ needs.deploy_production_front_door.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Prod Front Door' : ':heavy-minus-sign:   Deploy Prod Front Door'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.poll_site.result }}' === 'success' ? ':heavy-check-mark:   Wait for new version' : '${{ needs.poll_site.result }}' === 'failure' ? ':heavy-cross-mark:   Wait for new version' : ':heavy-minus-sign:   Wait for new version'
+                    }
+                  },
+            {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.poll_site.result }}' === 'success' ? ':heavy-check-mark:   Find version to destroy' : '${{ needs.poll_site.result }}' === 'failure' ? ':heavy-cross-mark:   Find version to destroy' : ':heavy-minus-sign:   Find version to destroy'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.destroy_old_terraform.result }}' === 'success' ? ':heavy-check-mark:   Destroy Old Prod Infra' : '${{ needs.deploy_production_front_door.result }}' === 'failure' ? ':heavy-cross-mark:   Destroy Old Prod Infra' : ':heavy-minus-sign:   Destroy Old Prod Infra'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.close_prod_storage_account_firewalls.result }}' === 'success' ? ':heavy-check-mark:   Close Prod Storage Account Firewalls' : '${{ needs.close_prod_storage_account_firewalls.result }}' === 'failure' ? ':heavy-cross-mark:   Close Prod Storage Account Firewalls' : ':heavy-minus-sign:   Close Prod Storage Account Firewalls'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.output_website_urls.result }}' === 'success' ? ':heavy-check-mark:   Output Website Urls' : '${{ needs.output_website_urls.result }}' === 'failure' ? ':heavy-cross-mark:   Output Website Urls' : ':heavy-minus-sign:   Output Website Urls'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ job.status }}' === 'success' ? ':heavy-check-mark:   Post to Slack' : '${{ job.status }}' === 'failure' ? ':heavy-cross-mark:   Post to Slack' : ':heavy-minus-sign:   Post to Slack'
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Useful link for this workflow run.*"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ":hammer_and_wrench:   Workflow run for this deployment"
+                    },
+                    "accessory": {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Workflow run",
+                        "emoji": true
+                      },
+                      "value": "Link to this run instance",
+                      "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "action_id": "button-action"
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Storybook and Website links for Staging and Production environments.*"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ":jigsaw:   Storybook"
+                    },
+                    "accessory": {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View storybook",
+                        "emoji": true
+                      },
+                      "value": "Link to Storybook website",
+                      "url": '${{ needs.deploy_canary_frontend_terraform.result }}' === 'success' && '${{ needs.deploy_storybook.result }}' === 'success' ? '${{ needs.deploy_staging_frontend_terraform.outputs.storybook_web_endpoint }}' : 'https://www.google.com/404.html',
+                      "action_id": "button-action"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ":globe_with_meridians:   Digital-Hybrid website - Staging"
+                    },
+                    "accessory": {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View website - Staging",
+                        "emoji": true
+                      },
+                      "value": "Link to DH website - Staging",
+                      "url": '${{ needs.deploy_staging_frontend_terraform.result }}' === 'success' && '${{ needs.deploy_staging_frontend.result }}' === 'success' ? '${{ needs.deploy_staging_frontend_terraform.outputs.website_cname }}' : 'https://www.google.com/404.html',
+                      "action_id": "button-action"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ":globe_with_meridians:   Digital-Hybrid website - Production"
+                    },
+                    "accessory": {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View website - Production",
+                        "emoji": true
+                      },
+                      "value": "Link to DH website - Production",
+                      "url": '${{ needs.deploy_canary_frontend_terraform.result }}' === 'success' && '${{ needs.deploy_canary_frontend.result }}' === 'success' ? '${{ needs.deploy_canary_frontend_terraform.outputs.website_cname }}' : 'https://www.google.com/404.html',
+                      "action_id": "button-action"
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {
+                        "type": "mrkdwn",
+                        "text": ":airplane_arriving: *<!date^${{ steps.set-variables.outputs.current-timestamp }}^Posted on {date_long} at {time_secs}|Date and Time of this message when it was posted.>*"
+                      }
+                    ]
+                  }
+                ]
+              }]
+            }

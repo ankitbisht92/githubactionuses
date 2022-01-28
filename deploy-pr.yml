@@ -1,0 +1,1912 @@
+name: "Deploy PR environment"
+
+on: pull_request
+
+jobs:
+  detect_changes:
+    name: "Detect changes"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@v2.10.1
+        id: changes
+        with:
+          filters: |
+            pipelines:
+              - '.github/workflows/**'
+            tf_resource_group:
+              - 'terraform/resource_group/**'
+              - 'terraform/modules/**'
+            tf_apim:
+              - 'terraform/apim/**'
+              - 'terraform/modules/**'
+            tf_infra:
+              - 'terraform/frontend/**'
+              - 'terraform/backend/**'
+              - 'terraform/modules/**'
+            packages:
+              - 'packages/**'
+
+    outputs:
+      has_pipeline_changes: ${{ steps.changes.outputs.pipelines }}
+      has_tf_resource_group_changes: ${{ steps.changes.outputs.tf_resource_group }}
+      has_tf_apim_changes: ${{ steps.changes.outputs.tf_apim }}
+      has_tf_infra_changes: ${{ steps.changes.outputs.tf_infra }}
+      has_package_changes: ${{ steps.changes.outputs.packages }}
+
+  build_cache:
+    name: "Build caches"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Set cache metadata"
+        id: cache-meta
+        run: |
+          echo "::set-output name=key::${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}"
+          echo "::set-output name=yarn-path::$(yarn config get cacheFolder)"
+          echo "::set-output name=modules-path::**/node_modules"
+
+      - name: "Check for existing yarn cache"
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Check for existing node modules cache"
+        uses: actions/cache@v2
+        id: node-modules-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Install missing dependencies"
+        if: ${{ steps.yarn-cache.outputs.cache-hit != 'true' || steps.node-modules-cache.outputs.cache-hit != 'true'}}
+        run: yarn install
+
+    outputs:
+      key: ${{ steps.cache-meta.outputs.key }}
+      yarn-path: ${{ steps.cache-meta.outputs.yarn-path }}
+      modules-path: ${{ steps.cache-meta.outputs.modules-path }}
+
+  build_windows_cache:
+    name: "Build windows caches"
+    runs-on: windows-latest
+    steps:
+      - name: "Enable long paths"
+        run: git config --system core.longpaths true
+
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Set cache metadata"
+        id: cache-meta
+        run: |
+          echo "::set-output name=key::${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}"
+          echo "::set-output name=yarn-path::$(yarn config get cacheFolder)"
+          echo "::set-output name=modules-path::**/node_modules"
+
+      - name: "Check for existing yarn cache"
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Check for existing node modules cache"
+        uses: actions/cache@v2
+        id: node-modules-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Install missing dependencies"
+        if: ${{ steps.yarn-cache.outputs.cache-hit != 'true' || steps.node-modules-cache.outputs.cache-hit != 'true'}}
+        run: yarn install
+
+    outputs:
+      key: ${{ steps.cache-meta.outputs.key }}
+      yarn-path: ${{ steps.cache-meta.outputs.yarn-path }}
+      modules-path: ${{ steps.cache-meta.outputs.modules-path }}
+
+  derive_environment_prefix:
+    name: "Derive environment prefix"
+    runs-on: ubuntu-latest
+    steps:
+      # Use the first 7 chars of the hash of the branch name
+      - name: "Derive environment prefix"
+        id: derive-prefix
+        shell: bash
+        run: echo "::set-output name=sha-subset::$(echo ${{ github.head_ref }} | md5sum | awk '{print tolower(substr( $0, 1, 7))}')"
+
+    outputs:
+      prefix: ${{ steps.derive-prefix.outputs.sha-subset }}
+
+  deploy_launchdarkly_env:
+    name: "Deploy LaunchDarkly environment"
+    needs:
+      - derive_environment_prefix
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/launch_darkly
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      LAUNCHDARKLY_ACCESS_TOKEN: ${{ secrets.LAUNCHDARKLY_API_KEY }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/pr.backend" \
+            -backend-config="key=${{ needs.derive_environment_prefix.outputs.prefix }}/launchdarkly.tfstate"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/pr.tfvars" \
+            -out="dev-ld-plan.tfplan"
+        env:
+          TF_VAR_environment_name: ${{ needs.derive_environment_prefix.outputs.prefix }}
+
+      - name: "Copy TF plan to reports dir"
+        if: always()
+        run: |
+          mkdir -p ../../terraform_plans/dev
+          cp dev-ld-plan.tfplan ../../terraform_plans/dev
+
+      - name: "Upload Terraform plan"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/terraform_plans
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            dev-ld-plan.tfplan
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > ld-outputs.json
+          echo ::set-output name=ld-client-id::$( jq -r .ld_client_id.value ld-outputs.json )
+
+    outputs:
+      ld_client_id: ${{ steps.set-terraform-outputs.outputs.ld-client-id }}
+
+  test_function_apps:
+    name: "Unit test function apps"
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - build_cache
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Run unit tests"
+        run: yarn all:fa:test
+
+      - name: "Move unit tests to report dir"
+        if: always()
+        run: |
+          mkdir -p unit_tests
+          mv packages/function-apps/*/jesttestreport/* unit_tests/
+
+      - name: "Upload test reports"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/unit_tests
+
+  package_function_apps:
+    name: "Package Function Apps"
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - build_cache
+      - test_function_apps
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Install function app dependencies"
+        run: |
+          yarn workspaces focus --production @tsw/function-app-features @tsw/function-app-projections @tsw/function-app-returns @tsw/function-app-wrappers
+
+      - name: "Build and create function app zips"
+        run: yarn all:fa:build:zip
+
+      - name: "Collect function apps"
+        run: |
+          mkdir -p ./function-app-zips
+          yarn all:fa:copy-zip
+
+      - name: "Upload function app packages"
+        uses: actions/upload-artifact@v2
+        with:
+          name: function-app-zips
+          path: function-app-zips
+          if-no-files-found: error
+
+    outputs:
+      artifact-name: "function-app-zips"
+
+  deploy_rg_terraform:
+    name: "Deploy Resource Group"
+    if: always() && (needs.detect_changes.outputs.has_tf_resource_group_changes == 'true' || needs.detect_changes.outputs.has_pipeline_changes == 'true')
+    runs-on: ubuntu-latest
+    needs:
+      - detect_changes
+
+    defaults:
+      run:
+        working-directory: ./terraform/resource_group
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/dev.backend"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        id: rg-plan
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/dev.tfvars" \
+            -out="dev-rg-plan.tfplan"
+
+      - name: "Copy TF plan to reports dir"
+        if: always()
+        run: |
+          mkdir -p ../../terraform_plans/dev
+          cp dev-rg-plan.tfplan ../../terraform_plans/dev
+
+      - name: "Upload Terraform plan"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/terraform_plans
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            dev-rg-plan.tfplan
+
+  get_dev_rg_outputs:
+    name: "Get dev resource group outputs"
+    if: always()
+    needs:
+      - deploy_rg_terraform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/resource_group
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/dev.backend"
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > dev-rg-outputs.json
+          echo ::set-output name=resource-group-name::$( jq -r .resource_group_name.value dev-rg-outputs.json)
+
+    outputs:
+      resource_group_name: ${{ steps.set-terraform-outputs.outputs.resource-group-name }}
+
+  deploy_apim_terraform:
+    name: "Deploy APIM"
+    if: always() && (needs.detect_changes.outputs.has_tf_apim_changes == 'true' || needs.detect_changes.outputs.has_pipeline_changes == 'true')
+    needs:
+      - detect_changes
+      - get_dev_rg_outputs
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/apim
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/dev.backend"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/dev.tfvars" \
+            -out="dev-apim-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_myaccount_signing_key: ${{ secrets.NON_PROD_MYACCOUNTS_SIGNING_KEY}}
+          TF_VAR_xplan_username: ${{ secrets.NON_PROD_XPLAN_USERNAME }}
+          TF_VAR_xplan_password: ${{ secrets.NON_PROD_XPLAN_PASSWORD }}
+          TF_VAR_myaccount_guest_username: ${{ secrets.MYACCOUNT_GUEST_USERNAME }}
+          TF_VAR_myaccount_guest_password: ${{ secrets.MYACCOUNT_GUEST_PASSWORD }}
+          TF_VAR_xplan_app_id: ${{ secrets.NON_PROD_XPLAN_APP_ID }}
+          TF_VAR_slack_security_alert_webhook_url: ${{ secrets.SLACK_SECURITY_ALERT_WEBHOOK_URL }}
+
+      - name: "Copy TF plan to reports dir"
+        if: always()
+        run: |
+          mkdir -p ../../terraform_plans/dev
+          cp dev-apim-plan.tfplan ../../terraform_plans/dev
+
+      - name: "Upload Terraform plan"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/terraform_plans
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            dev-apim-plan.tfplan
+
+  get_dev_apim_outputs:
+    name: "Get dev APIM outputs"
+    if: always()
+    needs:
+      - deploy_apim_terraform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/apim
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/dev.backend"
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > apim-outputs.json
+          echo ::set-output name=apim-name::$( jq -r .apim_name.value apim-outputs.json )
+          echo ::set-output name=apim-vnet-name::$( jq -r .apim_vnet_name.value apim-outputs.json )
+          echo ::set-output name=apim-subnet-name::$( jq -r .apim_subnet_name.value apim-outputs.json )
+          echo ::set-output name=cdn-profile-website-name::$( jq -r .cdn_profile_website_name.value apim-outputs.json )
+          echo ::set-output name=cdn-profile-storybook-name::$( jq -r .cdn_profile_storybook_name.value apim-outputs.json )
+          echo ::set-output name=app-insights-name::$( jq -r .app_insights_name.value apim-outputs.json )
+          echo ::set-output name=app-insights-connection-string::$( jq -r .app_insights_connection_string.value apim-outputs.json )
+          echo ::set-output name=version-set-id::$( jq -r .version_set_id.value apim-outputs.json )
+
+    outputs:
+      apim_name: ${{ steps.set-terraform-outputs.outputs.apim-name }}
+      apim_vnet_name: ${{ steps.set-terraform-outputs.outputs.apim-vnet-name }}
+      apim_subnet_name: ${{ steps.set-terraform-outputs.outputs.apim-subnet-name }}
+      cdn_profile_website_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-website-name }}
+      cdn_profile_storybook_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-storybook-name }}
+      app_insights_name: ${{ steps.set-terraform-outputs.outputs.app-insights-name }}
+      app_insights_connection_string: ${{ steps.set-terraform-outputs.outputs.app-insights-connection-string }}
+      version_set_id: ${{ steps.set-terraform-outputs.outputs.version-set-id }}
+
+  deploy_frontend_infra:
+    name: "Deploy Frontend Infrastructure"
+    if: always()
+    needs:
+      - get_dev_rg_outputs
+      - get_dev_apim_outputs
+      - derive_environment_prefix
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/frontend
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/pr.backend" \
+            -backend-config="key=${{ needs.derive_environment_prefix.outputs.prefix }}/terraform.tfstate"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/dev.tfvars" \
+            -out="dev-frontend-plan.tfplan"
+        env:
+          TF_VAR_environment_prefix: ${{ needs.derive_environment_prefix.outputs.prefix }}
+          TF_VAR_git_branch_name: ${{ github.head_ref }}
+          TF_VAR_resource_group_name: ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_apim_name: ${{ needs.get_dev_apim_outputs.outputs.apim_name }}
+          TF_VAR_cdn_profile_website_name: ${{ needs.get_dev_apim_outputs.outputs.cdn_profile_website_name }}
+          TF_VAR_cdn_profile_storybook_name: ${{ needs.get_dev_apim_outputs.outputs.cdn_profile_storybook_name }}
+          TF_VAR_app_insights_name: ${{ needs.get_dev_apim_outputs.outputs.app_insights_name }}
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            dev-frontend-plan.tfplan
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > infra-outputs.json
+          echo ::set-output name=frontend-storage-account-name::$( jq -r .frontend_storage_account_name.value infra-outputs.json )
+          echo ::set-output name=website-endpoint::$( jq -r .frontend_web_endpoint.value infra-outputs.json )
+          echo ::set-output name=website-cdn-endpoint-name::$( jq -r .frontend_cdn_endpoint_name.value infra-outputs.json )
+          echo ::set-output name=storybook-web-endpoint::$( jq -r .storybook_web_endpoint.value infra-outputs.json )
+          echo ::set-output name=storybook-storage-account-name::$( jq -r .storybook_storage_account_name.value infra-outputs.json )
+          echo ::set-output name=storybook-cdn-endpoint-name::$( jq -r .storybook_cdn_endpoint_name.value infra-outputs.json )
+          echo ::set-output name=myaccounts-home-url::$( jq -r .myaccounts_home_url.value infra-outputs.json )
+          echo ::set-output name=bestinvest-investment-search-url::$( jq -r .bestinvest_investment_search_url.value infra-outputs.json )
+          echo ::set-output name=gtm-env-auth::$( jq -r .gtm_env_auth.value infra-outputs.json )
+          echo ::set-output name=gtm-env-preview::$( jq -r .gtm_env_preview.value infra-outputs.json )
+          echo ::set-output name=frontend-static-web-url::$( jq -r .frontend_static_web_url.value infra-outputs.json )
+
+    outputs:
+      frontend_storage_account_name: ${{ steps.set-terraform-outputs.outputs.frontend-storage-account-name }}
+      website_endpoint: ${{ steps.set-terraform-outputs.outputs.website-endpoint }}
+      website_cdn_endpoint_name: ${{ steps.set-terraform-outputs.outputs.website-cdn-endpoint-name }}
+      storybook_storage_account_name: ${{ steps.set-terraform-outputs.outputs.storybook-storage-account-name }}
+      storybook_web_endpoint: ${{ steps.set-terraform-outputs.outputs.storybook-web-endpoint }}
+      storybook_cdn_endpoint_name: ${{ steps.set-terraform-outputs.outputs.storybook-cdn-endpoint-name }}
+      myaccounts_home_url: ${{ steps.set-terraform-outputs.outputs.myaccounts-home-url }}
+      bestinvest_investment_search_url: ${{ steps.set-terraform-outputs.outputs.bestinvest-investment-search-url }}
+      gtm_env_auth: ${{ steps.set-terraform-outputs.outputs.gtm-env-auth }}
+      gtm_env_preview: ${{ steps.set-terraform-outputs.outputs.gtm-env-preview }}
+      frontend_static_web_url: ${{ steps.set-terraform-outputs.outputs.frontend-static-web-url }}
+
+  deploy_backend_infra:
+    name: "Deploy Backend Infrastructure"
+    if: always() && needs.deploy_frontend_infra.result == 'success'
+    needs:
+      - get_dev_rg_outputs
+      - get_dev_apim_outputs
+      - derive_environment_prefix
+      - package_function_apps
+      - deploy_frontend_infra
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/backend
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Download function app zips"
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ needs.package_function_apps.outputs.artifact-name }}
+          path: ./terraform/backend/zips
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/pr.backend" \
+            -backend-config="key=${{ needs.derive_environment_prefix.outputs.prefix }}/backend.tfstate"
+
+      - name: "Terraform Validate"
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/dev.tfvars" \
+            -out="dev-backend-plan.tfplan"
+        env:
+          TF_VAR_apim_name: ${{ needs.get_dev_apim_outputs.outputs.apim_name }}
+          TF_VAR_apim_subnet_name: ${{ needs.get_dev_apim_outputs.outputs.apim_subnet_name }}
+          TF_VAR_apim_vnet_name: ${{ needs.get_dev_apim_outputs.outputs.apim_vnet_name }}
+          TF_VAR_app_insights_name: ${{ needs.get_dev_apim_outputs.outputs.app_insights_name }}
+          TF_VAR_environment_prefix: ${{ needs.derive_environment_prefix.outputs.prefix }}
+          TF_VAR_frontend_cdn_url: ${{ needs.deploy_frontend_infra.outputs.website_endpoint }}
+          TF_VAR_git_branch_name: ${{ github.head_ref }}
+          TF_VAR_resource_group_name: ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_myaccounts_aes_key: ${{ secrets.MYACCOUNTS_AES_KEY }}
+          TF_VAR_myaccounts_aes_key_vector: ${{ secrets.MYACCOUNTS_AES_KEY_VECTOR }}
+          TF_VAR_version_set_id: ${{ needs.get_dev_apim_outputs.outputs.version_set_id }}
+
+      - name: "Terraform Apply"
+        run: |
+          terraform apply \
+            -lock-timeout=15m \
+            -auto-approve \
+            dev-backend-plan.tfplan
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > infra-outputs.json
+          echo ::set-output name=api-base-url::$( jq -r .api_base_url.value infra-outputs.json )
+          echo ::set-output name=api-endpoints::$( jq -r .api_endpoints.value infra-outputs.json )
+
+    outputs:
+      api_base_url: ${{ steps.set-terraform-outputs.outputs.api-base-url }}
+      api_endpoints: ${{ steps.set-terraform-outputs.outputs.api-endpoints }}
+
+  open_storage_account_firewalls:
+    name: "Open storage account firewalls for uploads"
+    if: always() && needs.deploy_frontend_infra.result == 'success'
+    runs-on: ubuntu-latest
+    needs:
+      - get_dev_rg_outputs
+      - deploy_frontend_infra
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Set default rule to allow to enable uploads"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage account update --resource-group ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }} --name ${{ needs.deploy_frontend_infra.outputs.storybook_storage_account_name }} --default-action Allow
+            az storage account update --resource-group ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }} --name ${{ needs.deploy_frontend_infra.outputs.frontend_storage_account_name }} --default-action Allow
+
+  clear_storybook_storage_account:
+    name: "Clear storybook storage account"
+    if: always() && needs.open_storage_account_firewalls.result == 'success'
+    runs-on: ubuntu-latest
+    needs:
+      - deploy_frontend_infra
+      - open_storage_account_firewalls
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Clear storybook storage account"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob delete-batch --account-name "${{ needs.deploy_frontend_infra.outputs.storybook_storage_account_name }}" --source '$web'
+
+  linting:
+    name: "Checks"
+    if: always() && (needs.detect_changes.outputs.has_package_changes == 'true' || needs.detect_changes.outputs.has_pipeline_changes == 'true')
+    runs-on: ubuntu-latest
+    needs:
+      - detect_changes
+      - build_cache
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Run typecheck"
+        run: yarn all:typecheck
+
+      - name: "Run linting"
+        if: always()
+        run: yarn all:lint
+
+      - name: "Copy reports to report directories"
+        if: always()
+        run: |
+          mkdir -p eslintreports typecheck_logs
+          mv packages/*/eslintreport/* eslintreports
+          mv packages/utils/*/eslintreport/* eslintreports
+          cat \
+           packages/function-apps/*/typecheck.log \
+           packages/utils/*/typecheck.log \
+           packages/*/typecheck.log \
+           >> typecheck_logs/typecheck.log
+
+      - name: "Upload lint & typecheck reports"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/eslintreports
+            **/typecheck_logs
+
+  unit_test:
+    name: "Unit tests"
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - detect_changes
+      - build_cache
+    env:
+      JEST_HTML_REPORTER_PAGE_TITLE: Jest Test Summary for branch ${{ github.head_ref }}
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Run Unit tests and code coverage"
+        timeout-minutes: 20
+        run: |
+          yarn frontend test:coverage
+          yarn components test:coverage
+
+      - name: "Copy reports to reports dir"
+        if: always()
+        run: |
+          mkdir -p unit_tests unit_tests/react-components-coverage unit_tests/hybrid-frontend-coverage
+          cp -r packages/*/jesttestreport/* unit_tests
+          cp -r packages/hybrid-frontend/coverage/* unit_tests/hybrid-frontend-coverage
+          cp -r packages/react-components/coverage/* unit_tests/react-components-coverage
+
+      - name: "Upload Unit test reports"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/unit_tests
+
+  api_tests:
+    name: "Run API Tests"
+    if: always() && needs.deploy_backend_infra.result == 'success'
+    needs:
+      - deploy_backend_infra
+      - build_cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Run UI tests"
+        env:
+          API_TEST_USERNAME: ${{ secrets.API_TEST_USERNAME }}
+          API_TEST_PASSWORD: ${{ secrets.DH_TEST_PASSWORD }}
+          API_TEST_PIN_POSITION_2: ${{ secrets.DH_TEST_PIN_POSITION_2 }}
+          API_TEST_PIN_POSITION_4: ${{ secrets.DH_TEST_PIN_POSITION_4 }}
+          API_TEST_PIN_POSITION_6: ${{ secrets.DH_TEST_PIN_POSITION_6 }}
+          API_BASE_URL: ${{ needs.deploy_backend_infra.outputs.api_base_url }}
+        run: yarn test:bdd-api
+
+      - name: "Copy reports to reports dir"
+        if: always()
+        run: |
+          cp -r packages/testing/acceptance-tests/api/reports api_test_reports/
+
+      - name: "Upload test reports"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: "**/api_test_reports"
+
+  deploy_gatsby:
+    name: "Build & Deploy Gatsby"
+    if: always() && needs.deploy_frontend_infra.result == 'success'
+    needs:
+      - build_cache
+      - derive_environment_prefix
+      - get_dev_apim_outputs
+      - deploy_frontend_infra
+      - deploy_backend_infra
+      - deploy_launchdarkly_env
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Create PR env file"
+        working-directory: ./packages/hybrid-frontend
+        run: |
+          touch .env.pr
+          echo 'API_ENDPOINTS=${{ needs.deploy_backend_infra.outputs.api_endpoints }}' >> .env.pr
+          echo 'API_BASE_URL=${{ needs.deploy_backend_infra.outputs.api_base_url }}' >> .env.pr
+          echo 'MYACCOUNTS_HOME_URL=${{ needs.deploy_frontend_infra.outputs.myaccounts_home_url }}' >> .env.pr
+          echo 'BESTINVEST_INVESTMENT_SEARCH_URL=https://webalpha.bi-digital.co.uk/investment-search' >> .env.pr
+          echo 'GTM_AUTH=${{ needs.deploy_frontend_infra.outputs.gtm_env_auth }}' >> .env.pr
+          echo 'GTM_PREVIEW=${{ needs.deploy_frontend_infra.outputs.gtm_env_preview }}' >> .env.pr
+          echo 'AI_CONNECTION_STRING=${{ needs.get_dev_apim_outputs.outputs.app_insights_connection_string }}' >> .env.pr
+          echo 'SITE_VERSION=${{ needs.derive_environment_prefix.outputs.prefix }}' >> .env.pr
+          echo 'LAUNCH_DARKLY_CLIENT_ID=${{ needs.deploy_launchdarkly_env.outputs.ld_client_id }}' >> .env.pr
+          cat .env.pr
+
+      - name: "Gatsby build"
+        timeout-minutes: 5
+        run: GATSBY_ACTIVE_ENV=pr yarn frontend build
+
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Deploy Gatsby static website"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob delete-batch --account-name "${{ needs.deploy_frontend_infra.outputs.frontend_storage_account_name }}" --source '$web'
+            az storage blob upload-batch -s $GITHUB_WORKSPACE/packages/hybrid-frontend/public -d "\$web" --account-name "${{ needs.deploy_frontend_infra.outputs.frontend_storage_account_name }}"
+
+    outputs:
+      url: ${{ needs.deploy_frontend_infra.outputs.website_endpoint }}
+
+  get_staging_rg_outputs:
+    name: "Get staging resource group outputs"
+    if: always()
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/resource_group
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > staging-rg-outputs.json
+          echo ::set-output name=resource-group-name::$( jq -r .resource_group_name.value staging-rg-outputs.json)
+
+    outputs:
+      resource_group_name: ${{ steps.set-terraform-outputs.outputs.resource-group-name }}
+
+  get_staging_apim_outputs:
+    name: "Get staging APIM outputs"
+    if: always()
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/apim
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > apim-outputs.json
+          echo ::set-output name=apim-name::$( jq -r .apim_name.value apim-outputs.json )
+          echo ::set-output name=apim-vnet-name::$( jq -r .apim_vnet_name.value apim-outputs.json )
+          echo ::set-output name=apim-subnet-name::$( jq -r .apim_subnet_name.value apim-outputs.json )
+          echo ::set-output name=cdn-profile-website-name::$( jq -r .cdn_profile_website_name.value apim-outputs.json )
+          echo ::set-output name=cdn-profile-storybook-name::$( jq -r .cdn_profile_storybook_name.value apim-outputs.json )
+          echo ::set-output name=app-insights-name::$( jq -r .app_insights_name.value apim-outputs.json )
+          echo ::set-output name=version-set-id::$( jq -r .version_set_id.value apim-outputs.json )
+
+    outputs:
+      apim_name: ${{ steps.set-terraform-outputs.outputs.apim-name }}
+      apim_vnet_name: ${{ steps.set-terraform-outputs.outputs.apim-vnet-name }}
+      apim_subnet_name: ${{ steps.set-terraform-outputs.outputs.apim-subnet-name }}
+      cdn_profile_website_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-website-name }}
+      cdn_profile_storybook_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-storybook-name }}
+      app_insights_name: ${{ steps.set-terraform-outputs.outputs.app-insights-name }}
+      version_set_id: ${{ steps.set-terraform-outputs.outputs.version-set-id }}
+
+  plan_staging:
+    name: "Terraform plan staging"
+    needs:
+      - package_function_apps
+      - get_staging_rg_outputs
+      - get_staging_apim_outputs
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.NON_PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.NON_PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 93b71b78-b75b-4806-8282-97b9e70ae16c
+      ARM_TENANT_ID: ${{ secrets.NON_PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Download function app zips"
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ needs.package_function_apps.outputs.artifact-name }}
+          path: ./terraform/backend/zips
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+
+      - name: "Terraform Resource Group Init"
+        working-directory: ./terraform/resource_group
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Resource Group Plan"
+        working-directory: ./terraform/resource_group
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -no-color \
+            -out="stage-rg-plan.tfplan"
+
+      - name: "Convert Resource Group Plan to JSON"
+        working-directory: ./terraform/resource_group
+        run: terraform show -json stage-rg-plan.tfplan > stage-rg-plan.json
+
+      - name: "Terraform APIM Init"
+        working-directory: ./terraform/apim
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform APIM Plan"
+        working-directory: ./terraform/apim
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -no-color \
+            -out="stage-apim-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.get_staging_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_myaccount_signing_key: ${{ secrets.NON_PROD_MYACCOUNTS_SIGNING_KEY }}
+          TF_VAR_xplan_username: ${{ secrets.NON_PROD_XPLAN_USERNAME }}
+          TF_VAR_xplan_password: ${{ secrets.NON_PROD_XPLAN_PASSWORD }}
+          TF_VAR_myaccount_guest_username: ${{ secrets.MYACCOUNT_GUEST_USERNAME }}
+          TF_VAR_myaccount_guest_password: ${{ secrets.MYACCOUNT_GUEST_PASSWORD }}
+          TF_VAR_xplan_app_id: ${{ secrets.NON_PROD_XPLAN_APP_ID }}
+          TF_VAR_slack_security_alert_webhook_url: ${{ secrets.SLACK_SECURITY_ALERT_WEBHOOK_URL }}
+
+      - name: "Convert APIM Plan to JSON"
+        working-directory: ./terraform/apim
+        run: terraform show stage-apim-plan.tfplan -json > stage-apim-plan.json
+
+      - name: "Terraform Frontend Init"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Frontend Plan"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -no-color \
+            -out="stage-frontend-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.get_staging_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_apim_name: ${{ needs.get_staging_apim_outputs.outputs.apim_name }}
+          TF_VAR_cdn_profile_website_name: ${{ needs.get_staging_apim_outputs.outputs.cdn_profile_website_name }}
+          TF_VAR_cdn_profile_storybook_name: ${{ needs.get_staging_apim_outputs.outputs.cdn_profile_storybook_name }}
+          TF_VAR_app_insights_name: ${{ needs.get_staging_apim_outputs.outputs.app_insights_name }}
+          TF_VAR_git_branch_name: master
+
+      - name: "Convert Frontend Plan to JSON"
+        working-directory: ./terraform/frontend
+        run: terraform show stage-frontend-plan.tfplan -json > stage-frontend-plan.json
+
+      - name: "Terraform Frontend Outputs"
+        id: frontend-outputs
+        working-directory: ./terraform/frontend
+        run: |
+          echo ::set-output name=frontend-web-host::$( terraform output -json | jq -r .frontend_web_host.value )
+          echo ::set-output name=frontend-web-endpoint::$( terraform output -json | jq -r .frontend_web_endpoint.value )
+
+      - name: "Terraform Backend Init"
+        working-directory: ./terraform/backend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Backend Plan"
+        working-directory: ./terraform/backend
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -no-color \
+            -out="stage-backend-plan.tfplan"
+        env:
+          TF_VAR_apim_name: ${{ needs.get_staging_apim_outputs.outputs.apim_name }}
+          TF_VAR_apim_vnet_name: ${{ needs.get_staging_apim_outputs.outputs.apim_vnet_name }}
+          TF_VAR_apim_subnet_name: ${{ needs.get_staging_apim_outputs.outputs.apim_subnet_name }}
+          TF_VAR_app_insights_name: ${{ needs.get_staging_apim_outputs.outputs.app_insights_name }}
+          TF_VAR_frontend_cdn_url: ${{ steps.frontend-outputs.outputs.frontend-web-endpoint }}
+          TF_VAR_git_branch_name: master
+          TF_VAR_resource_group_name: ${{ needs.get_staging_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_myaccounts_aes_key: ${{ secrets.MYACCOUNTS_AES_KEY }}
+          TF_VAR_myaccounts_aes_key_vector: ${{ secrets.MYACCOUNTS_AES_KEY_VECTOR }}
+          TF_VAR_version_set_id: ${{ needs.get_staging_apim_outputs.outputs.version_set_id }}
+
+      - name: "Terraform Front Door Init"
+        working-directory: ./terraform/front_door
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/staging.backend"
+
+      - name: "Terraform Front Door Plan"
+        working-directory: ./terraform/front_door
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/staging.tfvars" \
+            -no-color \
+            -out="stage-fd-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.get_staging_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_cdn_endpoint_host: ${{ steps.frontend-outputs.outputs.frontend-web-host }}
+
+      - name: "Convert Front Door Plan to JSON"
+        working-directory: ./terraform/front_door
+        run: terraform show stage-fd-plan.tfplan -json > stage-fd-plan.json
+
+      - name: "Copy TF plan to reports dir"
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p terraform_plans/staging
+          cp terraform/*/stage-*-plan.json terraform_plans/staging
+
+      - name: "Upload Terraform plans"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/terraform_plans
+
+  get_prod_rg_outputs:
+    name: "Get prod resource group outputs"
+    if: always()
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/resource_group
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend"
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > prod-rg-outputs.json
+          echo ::set-output name=resource-group-name::$( jq -r .resource_group_name.value prod-rg-outputs.json)
+
+    outputs:
+      resource_group_name: ${{ steps.set-terraform-outputs.outputs.resource-group-name }}
+
+  get_prod_apim_outputs:
+    name: "Get prod APIM outputs"
+    if: always()
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform/apim
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: false
+
+      - name: "Terraform Init"
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend"
+
+      - name: "Set Terraform Outputs"
+        id: set-terraform-outputs
+        run: |
+          terraform output -json > apim-outputs.json
+          echo ::set-output name=apim-name::$( jq -r .apim_name.value apim-outputs.json )
+          echo ::set-output name=apim-vnet-name::$( jq -r .apim_vnet_name.value apim-outputs.json )
+          echo ::set-output name=apim-subnet-name::$( jq -r .apim_subnet_name.value apim-outputs.json )
+          echo ::set-output name=cdn-profile-website-name::$( jq -r .cdn_profile_website_name.value apim-outputs.json )
+          echo ::set-output name=cdn-profile-storybook-name::$( jq -r .cdn_profile_storybook_name.value apim-outputs.json )
+          echo ::set-output name=app-insights-name::$( jq -r .app_insights_name.value apim-outputs.json )
+          echo ::set-output name=version-set-id::$( jq -r .version_set_id.value apim-outputs.json )
+
+    outputs:
+      apim_name: ${{ steps.set-terraform-outputs.outputs.apim-name }}
+      apim_vnet_name: ${{ steps.set-terraform-outputs.outputs.apim-vnet-name }}
+      apim_subnet_name: ${{ steps.set-terraform-outputs.outputs.apim-subnet-name }}
+      cdn_profile_website_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-website-name }}
+      cdn_profile_storybook_name: ${{ steps.set-terraform-outputs.outputs.cdn-profile-storybook-name }}
+      app_insights_name: ${{ steps.set-terraform-outputs.outputs.app-insights-name }}
+      version_set_id: ${{ steps.set-terraform-outputs.outputs.version-set-id }}
+
+  get_prod_prefix:
+    name: "Get current prod env prefix"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Restore prefix file"
+        id: restore-prefix-file
+        uses: actions/cache@v2
+        with:
+          path: last_successful_deploy_prefix.txt
+          key: last_successful_deploy_prefix
+
+      - name: "Get prefix of last successful deploy"
+        id: get-prefix
+        run: |
+          echo ::set-output name=environment-prefix::$( cat last_successful_deploy_prefix.txt )
+          echo ::set-output name=state-file::$( cat last_successful_deploy_prefix.txt )
+
+    outputs:
+      environment_prefix: ${{ steps.get-prefix.outputs.environment-prefix }}
+      state_file: ${{ steps.get-prefix.outputs.state-file }}
+
+  plan_prod:
+    name: "Terraform plan prod"
+    needs:
+      - get_prod_prefix
+      - package_function_apps
+      - get_prod_rg_outputs
+      - get_prod_apim_outputs
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.PROD_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.PROD_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: 211bb550-03e5-4e25-8e32-05ee16ac07eb
+      ARM_TENANT_ID: ${{ secrets.PROD_ARM_TENANT_ID }}
+      TF_INPUT: false
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Download function app zips"
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ needs.package_function_apps.outputs.artifact-name }}
+          path: ./terraform/backend/zips
+
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.14.7
+
+      - name: "Terraform Resource Group Init"
+        working-directory: ./terraform/resource_group
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend"
+
+      - name: "Terraform Resource Group Plan"
+        working-directory: ./terraform/resource_group
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -no-color \
+            -out="prod-rg-plan.tfplan"
+
+      - name: "Convert Resource Group Plan to JSON"
+        working-directory: ./terraform/resource_group
+        run: terraform show prod-rg-plan.tfplan -json > prod-rg-plan.json
+
+      - name: "Terraform APIM Init"
+        working-directory: ./terraform/apim
+        run: |
+          terraform init \
+          -lock-timeout=15m \
+          -backend-config="./backends/prod.backend"
+
+      - name: "Terraform APIM Plan"
+        working-directory: ./terraform/apim
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -no-color \
+            -out="prod-apim-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.get_prod_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_myaccount_signing_key: ${{ secrets.PROD_MYACCOUNTS_SIGNING_KEY }}
+          TF_VAR_xplan_username: ${{ secrets.PROD_XPLAN_USERNAME }}
+          TF_VAR_xplan_password: ${{ secrets.PROD_XPLAN_PASSWORD }}
+          TF_VAR_myaccount_guest_username: ${{ secrets.MYACCOUNT_GUEST_USERNAME }}
+          TF_VAR_myaccount_guest_password: ${{ secrets.MYACCOUNT_GUEST_PASSWORD }}
+          TF_VAR_xplan_app_id: ${{ secrets.PROD_XPLAN_APP_ID}}
+          TF_VAR_slack_security_alert_webhook_url: ${{ secrets.SLACK_SECURITY_ALERT_WEBHOOK_URL }}
+
+      - name: "Covert APIM Plan to JSON"
+        working-directory: ./terraform/apim
+        run: terraform show prod-apim-plan.tfplan -json > prod-apim-plan.json
+
+      - name: "Terraform Frontend Init"
+        working-directory: ./terraform/frontend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend" \
+            -backend-config="key=infra/${{ needs.get_prod_prefix.outputs.state_file }}.tfstate"
+
+      - name: "Terraform Frontend Plan"
+        id: plan-infra
+        working-directory: ./terraform/frontend
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -no-color \
+            -out="prod-frontend-plan.tfplan"
+        env:
+          TF_VAR_environment_prefix: ${{ needs.get_prod_prefix.outputs.environment_prefix }}
+          TF_VAR_resource_group_name: ${{ needs.get_prod_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_apim_name: ${{ needs.get_prod_apim_outputs.outputs.apim_name }}
+          TF_VAR_cdn_profile_website_name: ${{ needs.get_prod_apim_outputs.outputs.cdn_profile_website_name }}
+          TF_VAR_cdn_profile_storybook_name: ${{ needs.get_prod_apim_outputs.outputs.cdn_profile_storybook_name }}
+          TF_VAR_app_insights_name: ${{ needs.get_prod_apim_outputs.outputs.app_insights_name }}
+          TF_VAR_git_branch_name: master
+
+      - name: "Convert Frontend Plan to JSON"
+        working-directory: ./terraform/frontend
+        run: terraform show prod-frontend-plan.tfplan -json > prod-frontend-plan.json
+
+      - name: "Terraform Frontend Outputs"
+        id: frontend-outputs
+        working-directory: ./terraform/frontend
+        run: |
+          echo ::set-output name=frontend-web-host::$( terraform output -json | jq -r .frontend_web_host.value )
+          echo ::set-output name=frontend-web-endpoint::$( terraform output -json | jq -r .frontend_web_endpoint.value )
+
+      - name: "Terraform Backend Init"
+        working-directory: ./terraform/backend
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend" \
+            -backend-config="key=infra/${{ needs.get_prod_prefix.outputs.state_file }}-backend.tfstate"
+
+      - name: "Terraform Backend Plan"
+        working-directory: ./terraform/backend
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -no-color \
+            -out="prod-backend-plan.tfplan"
+        env:
+          TF_VAR_apim_name: ${{ needs.get_prod_apim_outputs.outputs.apim_name }}
+          TF_VAR_apim_vnet_name: ${{ needs.get_prod_apim_outputs.outputs.apim_vnet_name }}
+          TF_VAR_apim_subnet_name: ${{ needs.get_prod_apim_outputs.outputs.apim_subnet_name }}
+          TF_VAR_app_insights_name: ${{ needs.get_prod_apim_outputs.outputs.app_insights_name }}
+          TF_VAR_environment_prefix: ${{ needs.get_prod_prefix.outputs.environment_prefix }}
+          TF_VAR_frontend_cdn_url: ${{ steps.frontend-outputs.outputs.frontend-web-endpoint }}
+          TF_VAR_git_branch_name: master
+          TF_VAR_resource_group_name: ${{ needs.get_prod_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_myaccounts_aes_key: ${{ secrets.MYACCOUNTS_AES_KEY }}
+          TF_VAR_myaccounts_aes_key_vector: ${{ secrets.MYACCOUNTS_AES_KEY_VECTOR }}
+          TF_VAR_version_set_id: ${{ needs.get_prod_apim_outputs.outputs.version_set_id }}
+
+      - name: "Convert Backend Plan to JSON"
+        working-directory: ./terraform/backend
+        run: terraform show prod-backend-plan.tfplan -json > prod-backend-plan.json
+
+      - name: "Terraform Front Door Init"
+        working-directory: ./terraform/front_door
+        run: |
+          terraform init \
+            -lock-timeout=15m \
+            -backend-config="./backends/prod.backend"
+
+      - name: "Terraform Front Door Plan"
+        working-directory: ./terraform/front_door
+        run: |
+          terraform plan \
+            -lock-timeout=15m \
+            -var-file="./var-files/prod.tfvars" \
+            -no-color \
+            -out="prod-fd-plan.tfplan"
+        env:
+          TF_VAR_resource_group_name: ${{ needs.get_prod_rg_outputs.outputs.resource_group_name }}
+          TF_VAR_cdn_endpoint_host: ${{ steps.frontend-outputs.outputs.frontend-web-host }}
+
+      - name: "Convert Front Door Plan to JSON"
+        working-directory: ./terraform/front_door
+        run: terraform show prod-fd-plan.tfplan -json > prod-fd-plan.json
+
+      - name: "Copy TF plan to reports dir"
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p terraform_plans/prod
+          cp terraform/*/prod-*-plan.json terraform_plans/prod
+
+      - name: "Upload Terraform plan"
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/terraform_plans
+
+  deploy_storybook:
+    name: "Build & deploy Storybook"
+    if: always() && needs.clear_storybook_storage_account.result == 'success'
+    needs:
+      - build_cache
+      - deploy_frontend_infra
+      - deploy_backend_infra
+      - get_dev_apim_outputs
+      - clear_storybook_storage_account
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Create PR env file"
+        working-directory: ./packages/hybrid-frontend
+        run: |
+          touch .env.production
+          echo 'API_ENDPOINTS=${{ needs.deploy_backend_infra.outputs.api_endpoints }}' >> .env.production
+          echo 'API_BASE_URL=${{ needs.deploy_backend_infra.outputs.api_base_url }}' >> .env.production
+          echo 'MYACCOUNTS_HOME_URL=${{ needs.deploy_frontend_infra.outputs.myaccounts_home_url }}' >> .env.production
+          echo 'BESTINVEST_INVESTMENT_SEARCH_URL=https://webalpha.bi-digital.co.uk/investment-search' >> .env.production
+          echo 'GTM_AUTH=${{ needs.deploy_frontend_infra.outputs.gtm_env_auth }}' >> .env.production
+          echo 'GTM_PREVIEW=${{ needs.deploy_frontend_infra.outputs.gtm_env_preview }}' >> .env.production
+          echo 'AI_CONNECTION_STRING=${{ needs.get_dev_apim_outputs.outputs.app_insights_connection_string }}' >> .env.production
+          cat .env.production
+
+      - name: "Build Storybook"
+        run: yarn build-storybook -o "./storybook-static"
+
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Deploy Storybook as static website"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob upload-batch -s $GITHUB_WORKSPACE/packages/hybrid-frontend/storybook-static -d "\$web" --account-name "${{ needs.deploy_frontend_infra.outputs.storybook_storage_account_name }}"
+
+    outputs:
+      url: ${{ needs.deploy_frontend_infra.outputs.storybook_web_endpoint }}
+
+  close_storage_account_firewalls:
+    name: "Close storage account firewalls for uploads"
+    if: always() && needs.deploy_frontend_infra.result == 'success'
+    runs-on: ubuntu-latest
+    needs:
+      - get_dev_rg_outputs
+      - deploy_frontend_infra
+      - deploy_gatsby
+      - deploy_storybook
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Set default rule to deny uploads"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage account update --resource-group ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }} --name ${{ needs.deploy_frontend_infra.outputs.storybook_storage_account_name }} --default-action Deny
+            az storage account update --resource-group ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }} --name ${{ needs.deploy_frontend_infra.outputs.frontend_storage_account_name }} --default-action Deny
+
+  purge_frontend_cdn_cache:
+    name: "Purge frontend CDN cache"
+    if: needs.deploy_gatsby.result == 'success'
+    runs-on: ubuntu-latest
+    needs:
+      - get_dev_rg_outputs
+      - get_dev_apim_outputs
+      - deploy_frontend_infra
+      - deploy_gatsby
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Purge frontend CDN cache"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az cdn endpoint purge --resource-group ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }} --name ${{needs.deploy_frontend_infra.outputs.website_cdn_endpoint_name}} --profile-name ${{ needs.get_dev_apim_outputs.outputs.cdn_profile_website_name }} --content-paths '/*'
+
+  purge_storybook_cdn_cache:
+    name: "Purge storybook CDN cache"
+    if: needs.deploy_storybook.result == 'success'
+    runs-on: ubuntu-latest
+    needs:
+      - get_dev_rg_outputs
+      - get_dev_apim_outputs
+      - deploy_frontend_infra
+      - deploy_storybook
+    steps:
+      - name: "Login to Azure"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.NON_PROD_AZURE_CREDENTIALS }}
+
+      - name: "Purge storybook CDN cache"
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az cdn endpoint purge --resource-group ${{ needs.get_dev_rg_outputs.outputs.resource_group_name }} --name ${{needs.deploy_frontend_infra.outputs.storybook_cdn_endpoint_name}} --profile-name ${{ needs.get_dev_apim_outputs.outputs.cdn_profile_storybook_name }} --content-paths '/*'
+
+  publish_results:
+    name: "Publish results"
+    if: always()
+    needs:
+      - derive_environment_prefix
+      - linting
+      - unit_test
+      - deploy_gatsby
+      - deploy_storybook
+      - plan_staging
+      - plan_prod
+      - deploy_launchdarkly_env
+      - deploy_frontend_infra
+      - get_staging_apim_outputs
+      - get_prod_apim_outputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Comment on PR"
+        uses: actions/github-script@v4
+        with:
+          script: |
+            const output = `
+            #### Reports
+            Visit the [latest run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for this PR and download the reports folder.
+            *Note that this link may not be the latest run for this PR.*
+
+            #### Review URLs
+            **Storybook:** [${{ needs.deploy_storybook.outputs.url }}](${{ needs.deploy_storybook.outputs.url }})
+            **Webpage:** [${{ needs.deploy_gatsby.outputs.url }}](${{ needs.deploy_gatsby.outputs.url }})
+
+            #### LaunchDarkly environment
+            **Name:** ${{ needs.derive_environment_prefix.outputs.prefix }}
+            **Client ID:** \`${{ needs.deploy_launchdarkly_env.outputs.ld_client_id }}\`
+            `;
+
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  post_to_slack:
+    if: always()
+    name: "Post to Slack"
+    needs:
+      - detect_changes
+      - build_cache
+      - derive_environment_prefix
+      - package_function_apps
+      - deploy_rg_terraform
+      - get_dev_rg_outputs
+      - deploy_apim_terraform
+      - get_dev_apim_outputs
+      - deploy_frontend_infra
+      - deploy_backend_infra
+      - deploy_launchdarkly_env
+      - open_storage_account_firewalls
+      - clear_storybook_storage_account
+      - linting
+      - unit_test
+      - deploy_gatsby
+      - deploy_storybook
+      - close_storage_account_firewalls
+      - get_staging_rg_outputs
+      - get_staging_apim_outputs
+      - plan_staging
+      - get_prod_rg_outputs
+      - get_prod_apim_outputs
+      - plan_prod
+      - publish_results
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Set variables"
+        id: set-variables
+        run: |
+          echo ::set-output name=current-timestamp::$( date +%s )
+          if [[
+            "${{
+              needs.detect_changes.result != 'failure' &&
+              needs.build_cache.result != 'failure' &&
+              needs.derive_environment_prefix.result != 'failure' &&
+              needs.deploy_launchdarkly_env.result != 'failure' &&
+              needs.package_function_apps.result != 'failure' &&
+              needs.deploy_rg_terraform.result != 'failure' &&
+              needs.get_dev_rg_outputs.result != 'failure' &&
+              needs.deploy_apim_terraform.result != 'failure' &&
+              needs.get_dev_apim_outputs.result != 'failure' &&
+              needs.deploy_frontend_infra.result != 'failure' &&
+              needs.deploy_backend_infra.result != 'failure' &&
+              needs.deploy_launchdarkly_env.result != 'failure' &&
+              needs.open_storage_account_firewalls.result != 'failure' &&
+              needs.clear_storybook_storage_account.result != 'failure' &&
+              needs.linting.result != 'failure' &&
+              needs.unit_test.result != 'failure' &&
+              needs.deploy_gatsby.result != 'failure' &&
+              needs.deploy_storybook.result != 'failure' &&
+              needs.close_storage_account_firewalls.result != 'failure' &&
+              needs.get_staging_rg_outputs.result != 'failure' &&
+              needs.get_staging_apim_outputs.result != 'failure' &&
+              needs.plan_staging.result != 'failure' &&
+              needs.get_prod_rg_outputs.result != 'failure' &&
+              needs.get_prod_apim_outputs.result != 'failure' &&
+              needs.plan_prod.result != 'failure' &&
+              needs.publish_results.result != 'failure'
+            }}" == "true"
+          ]]; then
+            echo ::set-output name=deployment-status::success
+          else
+            echo ::set-output name=deployment-status::failure
+          fi
+
+      - name: "Post to slack"
+        uses: 8398a7/action-slack@v3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.NON_PROD_SLACK_WEBHOOK_URL }}
+        with:
+          status: custom
+          custom_payload: |
+            {
+              attachments: [{
+                "color": '${{ steps.set-variables.outputs.deployment-status }}' !== 'failure' ? '#009933' : '#cc0000',
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": '${{ steps.set-variables.outputs.deployment-status }}' !== 'failure' ? 'Deployment Successful :rocket:' : 'Deployment Failed :rotating_light:',
+                      "emoji": true
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      { "type": "mrkdwn", "text": "*Workflow Name* : ${{ github.workflow }}" }
+                    ]
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      { "type": "mrkdwn", "text": "*LaunchDarkly environment* : ${{ needs.derive_environment_prefix.outputs.prefix }}" }
+                    ]
+                  },
+                  { "type": "context", "elements": [
+                      { "type": "mrkdwn", "text": "*Deployment initiated by*:" },
+                      { "type": "image", "image_url": "https://github.com/${{ github.actor }}.png?size=40", "alt_text": "Authors Avatar" },
+                      { "type": "plain_text", "text": "${{ github.actor }}", "emoji": true }
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ steps.set-variables.outputs.deployment-status }}' !== 'failure' ? ':heavy-check-mark:   *Deployment Status*: Success' : ':heavy-cross-mark:   *Deployment Status*: Failure'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ":merge:   *Branch Name*: <https://github.com/${{ github.repository }}/tree/${{ github.head_ref }}|${{ github.head_ref }}>"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ":arrow_right:   *Branch Prefix*: ${{ needs.derive_environment_prefix.outputs.prefix }}"
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Job Conclusions for this workflow run.*"
+                    }
+                  },
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.detect_changes.result }}' === 'success' ? ':heavy-check-mark:   Detect Changes' : '${{ needs.detect_changes.result }}' === 'failure' ? ':heavy-cross-mark:   Detect Changes' : ':heavy-minus-sign:   Detect Changes' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.build_cache.result }}' === 'success' ? ':heavy-check-mark:   Build Cache' : '${{ needs.build_cache.result }}' === 'failure' ? ':heavy-cross-mark:   Build Cache' : ':heavy-minus-sign:   Build Cache' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.derive_environment_prefix.result }}' === 'success' ? ':heavy-check-mark:   Derive Environment Prefix' : '${{ needs.derive_environment_prefix.result }}' === 'failure' ? ':heavy-cross-mark:   Derive Environment Prefix' : ':heavy-minus-sign:   Derive Environment Prefix' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.deploy_launchdarkly_env.result }}' === 'success' ? ':heavy-check-mark:   Deploy LaunchDarkly env' : '${{ needs.deploy_launchdarkly_env.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy LaunchDarkly env' : ':heavy-minus-sign:   Deploy LaunchDarkly env' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.package_function_apps.result }}' === 'success' ? ':heavy-check-mark:   Package Function Apps' : '${{ needs.package_function_apps.result }}' === 'failure' ? ':heavy-cross-mark:   Package Function Apps' : ':heavy-minus-sign:   Package Function Apps' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.deploy_rg_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy Resource Group' : '${{ needs.deploy_rg_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Resource Group' : ':heavy-minus-sign:   Deploy Resource Group' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.get_dev_rg_outputs.result }}' === 'success' ? ':heavy-check-mark:   Get Dev RG TF Outputs' : '${{ needs.get_dev_rg_outputs.result }}' === 'failure' ? ':heavy-cross-mark:   Dev RG TF Outputs' : ':heavy-minus-sign:   Get Dev RG TF Outputs' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.deploy_apim_terraform.result }}' === 'success' ? ':heavy-check-mark:   Deploy APIM' : '${{ needs.deploy_apim_terraform.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy APIM' : ':heavy-minus-sign:   Deploy APIM' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.get_dev_apim_outputs.result }}' === 'success' ? ':heavy-check-mark:   Get Dev APIM TF Outputs' : '${{ needs.get_dev_apim_outputs.result }}' === 'failure' ? ':heavy-cross-mark:   Get Dev APIM TF Outputs' : ':heavy-minus-sign:   Get Dev APIM TF Outputs' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.deploy_frontend_infra.result }}' === 'success' ? ':heavy-check-mark:   Deploy Frontend Infrastructure' : '${{ needs.deploy_frontend_infra.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Frontend Infrastructure' : ':heavy-minus-sign:   Deploy Frontend Infrastructure' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.deploy_backend_infra.result }}' === 'success' ? ':heavy-check-mark:   Deploy Backend Infrastructure' : '${{ needs.deploy_backend_infra.result }}' === 'failure' ? ':heavy-cross-mark:   Deploy Backend Infrastructure' : ':heavy-minus-sign:   Deploy Backend Infrastructure' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.open_storage_account_firewalls.result }}' === 'success' ? ':heavy-check-mark:   Open Storage Account Firewalls' : '${{ needs.open_storage_account_firewalls.result }}' === 'failure' ? ':heavy-cross-mark:   Open Storage Account Firewalls' : ':heavy-minus-sign:   Open Storage Account Firewalls' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.clear_storybook_storage_account.result }}' === 'success' ? ':heavy-check-mark:   Clear Storybook Storage Account' : '${{ needs.clear_storybook_storage_account.result }}' === 'failure' ? ':heavy-cross-mark:   Clear Storybook Storage Account' : ':heavy-minus-sign:   Clear Storybook Storage Account'}},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.get_staging_rg_outputs.result }}' === 'success' ? ':heavy-check-mark:   Get Staging RG TF Outputs' : '${{ needs.get_staging_rg_outputs.result }}' === 'failure' ? ':heavy-cross-mark:   Get Staging RG TF Outputs' : ':heavy-minus-sign:   Get Staging RG TF Outputs' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.get_staging_apim_outputs.result }}' === 'success' ? ':heavy-check-mark:   Get Staging APIM TF Outputs' : '${{ needs.get_staging_apim_outputs.result }}' === 'failure' ? ':heavy-cross-mark:   Get Staging APIM TF Outputs' : ':heavy-minus-sign:   Get Staging APIM TF Outputs' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.plan_staging.result }}' === 'success' ? ':heavy-check-mark:   Terraform Plan - Staging' : '${{ needs.plan_staging.result }}' === 'failure' ? ':heavy-cross-mark:   Terraform Plan - Staging' : ':heavy-minus-sign:   Terraform Plan - Staging' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.get_prod_rg_outputs.result }}' === 'success' ? ':heavy-check-mark:   Get Prod RG TF Outputs' : '${{ needs.get_prod_rg_outputs.result }}' === 'failure' ? ':heavy-cross-mark:   Get Prod RG TF Outputs' : ':heavy-minus-sign:   Get Prod RG TF Outputs' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.get_prod_apim_outputs.result }}' === 'success' ? ':heavy-check-mark:   Get Prod APIM TF Outputs' : '${{ needs.get_prod_apim_outputs.result }}' === 'failure' ? ':heavy-cross-mark:   Get Prod APIM TF Outputs' : ':heavy-minus-sign:   Get Prod APIM TF Outputs' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.plan_prod.result }}' === 'success' ? ':heavy-check-mark:   Terraform Plan - Production' : '${{ needs.plan_prod.result }}' === 'failure' ? ':heavy-cross-mark:   Terraform Plan - Production' : ':heavy-minus-sign:   Terraform Plan - Production' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.linting.result }}' === 'success' ? ':heavy-check-mark:   Linting Checks' : '${{ needs.linting.result }}' === 'failure' ? ':heavy-cross-mark:   Linting Checks' : ':heavy-minus-sign:   Linting Checks' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.unit_test.result }}' === 'success' ? ':heavy-check-mark:   Unit Tests' : '${{ needs.unit_test.result }}' === 'failure' ? ':heavy-cross-mark:   Unit Tests' : ':heavy-minus-sign:   Unit Tests' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.deploy_storybook.result }}' === 'success' ? ':heavy-check-mark:   Build &amp; Deploy Storybook' : '${{ needs.deploy_storybook.result }}' === 'failure' ? ':heavy-cross-mark:   Build &amp; Deploy Storybook' : ':heavy-minus-sign:   Build &amp; Deploy Storybook' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.close_storage_account_firewalls.result }}' === 'success' ? ':heavy-check-mark:   Close Storage Account Firewalls' : '${{ needs.close_storage_account_firewalls.result }}' === 'failure' ? ':heavy-cross-mark:   Close Storage Account Firewalls' : ':heavy-minus-sign:   Close Storage Account Firewalls' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.deploy_gatsby.result }}' === 'success' ? ':heavy-check-mark:   Build &amp; Deploy Gatsby App' : '${{ needs.deploy_gatsby.result }}' === 'failure' ? ':heavy-cross-mark:   Build &amp; Deploy Gatsby App' : ':heavy-minus-sign:   Build &amp; Deploy Gatsby App' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ needs.publish_results.result }}' === 'success' ? ':heavy-check-mark:   Publish Results to PR' : '${{ needs.publish_results.result }}' === 'failure' ? ':heavy-cross-mark:   Publish Results to PR' : ':heavy-minus-sign:   Publish Results to PR' }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": '${{ job.status }}' === 'success' ? ':heavy-check-mark:   Post to Slack' : '${{ job.status }}' === 'failure' ? ':heavy-cross-mark:   Post to Slack' : ':heavy-minus-sign:   Post to Slack' }},
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Useful links for this workflow run.*"
+                    }
+                  },
+                  { "type": "section", "text": { "type": "mrkdwn", "text": ":hammer_and_wrench:   Workflow run for this deployment" }, "accessory": { "type": "button", "text": { "type": "plain_text", "text": "Workflow run", "emoji": true }, "value": "Link to this run instance", "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}", "action_id": "button-action" }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": ":page_facing_up:   Download reports from the link above" }},
+                  {
+                    "type": "divider"
+                  },
+                  { "type": "section", "text": { "type": "mrkdwn", "text": "*Storybook and Website links for this workflow run.*" }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": ":jigsaw:   Storybook" }, "accessory": { "type": "button", "text": { "type": "plain_text", "text": "View storybook", "emoji": true }, "value": "Link to Storybook website", "url": '${{ needs.deploy_frontend_infra.result }}' === 'success' ? '${{ needs.deploy_storybook.outputs.url }}' : 'https://www.google.com/404.html', "action_id": "button-action" }},
+                  { "type": "section", "text": { "type": "mrkdwn", "text": ":globe_with_meridians:   Digital-Hybrid website" }, "accessory": { "type": "button", "text": { "type": "plain_text", "text": "View website", "emoji": true }, "value": "Link to DH website", "url": '${{ needs.deploy_frontend_infra.result }}' === 'success' ? '${{ needs.deploy_gatsby.outputs.url }}' : 'https://www.google.com/404.html', "action_id": "button-action" }},
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {
+                        "type": "mrkdwn",
+                        "text": ":airplane_arriving: *<!date^${{ steps.set-variables.outputs.current-timestamp }}^Posted on {date_long} at {time_secs}|Date and Time of this message when it was posted.>*"
+                      }
+                    ]
+                  }
+                ]
+              }]
+            }

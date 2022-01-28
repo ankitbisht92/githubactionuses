@@ -1,0 +1,290 @@
+name: "Run UI jobs Nightly"
+
+on:
+  schedule:
+    # Runs at 10 PM every working day
+    - cron: 0 22 * * 1-5
+  workflow_dispatch:
+
+jobs:
+  build_cache:
+    name: "Build caches"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Set cache metadata"
+        id: cache-meta
+        run: |
+          echo "::set-output name=key::${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}"
+          echo "::set-output name=yarn-path::$(yarn config get cacheFolder)"
+          echo "::set-output name=modules-path::**/node_modules"
+
+      - name: "Check for existing yarn cache"
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Check for existing node modules cache"
+        uses: actions/cache@v2
+        id: node-modules-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Install missing dependencies"
+        if: ${{ steps.yarn-cache.outputs.cache-hit != 'true' || steps.node-modules-cache.outputs.cache-hit != 'true'}}
+        run: yarn install
+
+    outputs:
+      key: ${{ steps.cache-meta.outputs.key }}
+      yarn-path: ${{ steps.cache-meta.outputs.yarn-path }}
+      modules-path: ${{ steps.cache-meta.outputs.modules-path }}
+
+  build_windows_cache:
+    name: "Build windows caches"
+    runs-on: windows-latest
+    steps:
+      - name: "Enable long paths"
+        run: git config --system core.longpaths true
+
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Set cache metadata"
+        id: cache-meta
+        run: |
+          echo "::set-output name=key::${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}"
+          echo "::set-output name=yarn-path::$(yarn config get cacheFolder)"
+          echo "::set-output name=modules-path::**/node_modules"
+
+      - name: "Check for existing yarn cache"
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Check for existing node modules cache"
+        uses: actions/cache@v2
+        id: node-modules-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Install missing dependencies"
+        if: ${{ steps.yarn-cache.outputs.cache-hit != 'true' || steps.node-modules-cache.outputs.cache-hit != 'true'}}
+        run: yarn install
+
+    outputs:
+      key: ${{ steps.cache-meta.outputs.key }}
+      yarn-path: ${{ steps.cache-meta.outputs.yarn-path }}
+      modules-path: ${{ steps.cache-meta.outputs.modules-path }}
+
+  ui_test:
+    name: "UI tests"
+    environment: staging
+    runs-on: windows-latest
+    needs:
+      - build_cache
+      - build_windows_cache
+    strategy:
+      matrix:
+        browser: [chrome, edge]
+    steps:
+      - name: "Enable long paths"
+        run: git config --system core.longpaths true
+
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v1
+        with:
+          node-version: 14.x
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_windows_cache.outputs.key }}
+          path: ${{ needs.build_windows_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_windows_cache.outputs.key }}
+          path: ${{ needs.build_windows_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Update webdriver-manager"
+        run: yarn webdriver-manager update
+
+      - name: "Wait for UI response"
+        uses: emilioschepis/wait-for-endpoint@v1.0.2
+        with:
+          url: https://preview.alpha.bi-digital.co.uk/
+          method: GET
+          expected-status: 200
+          timeout: 600000
+          interval: 1000
+
+      - name: "Run UI tests"
+        run: yarn test:mock-ui
+        env:
+          BROWSER: ${{ matrix.browser }}
+          URL: https://preview.alpha.bi-digital.co.uk/
+          UI_USER_NAME: ${{ secrets.DH_TEST_USER_NAME }}
+          UI_USER_PASSWORD: ${{ secrets.DH_TEST_USER_PASSWORD }}
+
+      - name: "Copy reports to reports dir"
+        if: always()
+        run: |
+          mkdir -p ui_nightly_tests
+          cp -r packages/testing/wdio-mock-ui/mochawesome-report/* ui_nightly_tests
+
+      - name: "Upload UI test report"
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: reports
+          retention-days: 5
+          path: |
+            **/ui_nightly_tests
+
+  post_to_slack:
+    if: ${{ always() }}
+    name: "Post to Slack"
+    needs:
+      - build_cache
+      - build_windows_cache
+      - ui_test
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Set variables"
+        id: set-variables
+        run: |
+          echo ::set-output name=current-timestamp::$( date +%s )
+          if [[
+            "${{
+              needs.build_cache.result != 'failure' &&
+              needs.build_windows_cache.result != 'failure' &&
+              needs.ui_test.result != 'failure'
+            }}" == "true"
+          ]]; then
+            echo ::set-output name=nightlytest-status::success
+          else
+            echo ::set-output name=nightlytest-status::failure
+          fi
+
+      - name: "Post to slack"
+        uses: 8398a7/action-slack@v3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_ENG_CHANNEL }}
+        with:
+          status: custom
+          custom_payload: |
+            {
+              "attachments": [{
+                "color": '${{ steps.set-variables.outputs.nightlytest-status }}' !== 'failure' ? '#009933' : '#cc0000',
+                "blocks": [
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {"type": "mrkdwn", "text": "*Workflow Name* : ${{ github.workflow }}"}
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ steps.set-variables.outputs.nightlytest-status }}' !== 'failure' ? ':heavy-check-mark:   *Nightly Test Status*: Success' : ':heavy-cross-mark:   *Nightly Test Status*: Failure'
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Job Conclusions for this workflow run.*"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.build_cache.result }}' === 'success' ? ':heavy-check-mark:   Build Cache' : '${{ needs.build_cache.result }}' === 'failure' ? ':heavy-cross-mark:   Build Cache' : ':heavy-minus-sign:   Build Cache'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.build_windows_cache.result }}' === 'success' ? ':heavy-check-mark:   Build Windows Cache' : '${{ needs.build_windows_cache.result }}' === 'failure' ? ':heavy-cross-mark:   Build Windows Cache' : ':heavy-minus-sign:   Build Windows Cache'
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": '${{ needs.ui_test.result }}' === 'success' ? ':heavy-check-mark:   UI Tests' : '${{ needs.ui_test.result }}' === 'failure' ? ':heavy-cross-mark:   UI Tests' : ':heavy-minus-sign:   UI Tests'
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*Useful links for this workflow run.*"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": ":hammer_and_wrench:   Workflow run for the Nightly UI Test"},
+                    "accessory": {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "Workflow run", "emoji": true},
+                      "value": "Link to this run instance",
+                      "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "action_id": "button-action"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": ":page_facing_up:   Download reports from the link above"}
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {
+                        "type": "mrkdwn",
+                        "text": ":airplane_arriving: *<!date^${{ steps.set-variables.outputs.current-timestamp }}^Posted on {date_long} at {time_secs}|Date and Time of this message when it was posted.>*"
+                      }
+                    ]
+                  }
+                ]
+              }]
+            }

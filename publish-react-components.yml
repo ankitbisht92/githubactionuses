@@ -1,0 +1,104 @@
+name: "Publish React Components NPM Package"
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build_cache:
+    name: "Build caches"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Set cache metadata"
+        id: cache-meta
+        run: |
+          echo "::set-output name=key::${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}"
+          echo "::set-output name=yarn-path::$(yarn config get cacheFolder)"
+          echo "::set-output name=modules-path::**/node_modules"
+
+      - name: "Check for existing yarn cache"
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Check for existing node modules cache"
+        uses: actions/cache@v2
+        id: node-modules-cache
+        with:
+          key: ${{ steps.cache-meta.outputs.key }}
+          path: ${{ steps.cache-meta.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Install missing dependencies"
+        if: ${{ steps.yarn-cache.outputs.cache-hit != 'true' || steps.node-modules-cache.outputs.cache-hit != 'true'}}
+        run: yarn install
+
+    outputs:
+      key: ${{ steps.cache-meta.outputs.key }}
+      yarn-path: ${{ steps.cache-meta.outputs.yarn-path }}
+      modules-path: ${{ steps.cache-meta.outputs.modules-path }}
+
+  determine_version:
+    name: "Determine package version"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Parse GH ref"
+        id: parse-gh-ref
+        run: |
+          echo "${GITHUB_REF/refs\/tags\//} will be used as package version"
+          echo "::set-output name=tag::${GITHUB_REF/refs\/tags\//}"
+
+    outputs:
+      tag: ${{ steps.parse-gh-ref.outputs.tag }}
+
+  publish:
+    name: "Publish React Components Package"
+    needs:
+      - build_cache
+      - determine_version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v2
+
+      - name: "Use Node.js 14.x"
+        uses: actions/setup-node@v2
+        with:
+          node-version: 14.x
+          scope: "@TSWDTS"
+          registry-url: "https://npm.pkg.github.com"
+
+      - name: "Get yarn cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.yarn-path }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: "Get node modules cache"
+        uses: actions/cache@v2
+        with:
+          key: ${{ needs.build_cache.outputs.key }}
+          path: ${{ needs.build_cache.outputs.modules-path }}
+          restore-keys: |
+            ${{ runner.os }}-modules-
+
+      - name: "Publish package to GitHub packages"
+        run: |
+          echo "Preparing to publish react components version: ${{ needs.determine_version.outputs.tag }}"
+          yarn components npm-set-version ${{ needs.determine_version.outputs.tag }}
+          yarn components npm-publish
+        env:
+          YARN_NPM_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
