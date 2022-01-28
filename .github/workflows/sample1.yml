@@ -51,7 +51,7 @@ jobs:
     #thirdjob
     #runs-on: ubuntu-latest
     #steps:
-     # - uses: actions/checkout@v1
+     # - uses: actions/checkout@v2
      # - name: decrpting file
      #   run: gpg --quiet --batch --yes --decrypt demo.json.gpg --passphrase="${PASSPHRASE}" --output $HOME/demo.json #demo.json.gpg
      #   env:
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Dump GitHub context
-        id: github_context_step
+        id: github_context
         run: echo '${{ toJSON(github) }}'
       - name: Dump job context
         run: echo '${{ toJSON(job) }}'
@@ -79,10 +79,10 @@ jobs:
   
   condition-demo:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     steps:
-      - name: echo my Repository
-        run: eccho ${GITHUB_REPOSITORY}
+      - name: echo my Actor
+        run: echo ${GITHUB_ACTOR}
       - name: echo my new variable
         if: success()
         run: echo ${WF_VARIABLE}
