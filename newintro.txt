@@ -1,0 +1,1 @@
+This is a text file which i want to merge into master branch with some default checks been running.
